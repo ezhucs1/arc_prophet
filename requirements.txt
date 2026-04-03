@@ -1,0 +1,6 @@
+langchain>=1.2.13
+langchain-core>=1.2.19
+langchain-openai>=1.1.11
+langgraph>=1.1.2
+langfuse>=4.0.1
+python-dotenv
