@@ -15,7 +15,7 @@ import re
 import signal
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +27,7 @@ load_dotenv()
 
 from database.loader import load_polymarket, load_polymarket_timeseries
 from agent.react_agent import run_react
+from agent.prompts import ZERO_SHOT_SYSTEM_PROMPT
 
 DATASET_PATH = Path(__file__).parent.parent / "database" / "polymarket_binary_yesno.jsonl"
 RESULTS_DIR  = Path(__file__).parent / "results"
@@ -37,16 +38,32 @@ DEFAULT_TIMEOUT_SEC = 300
 
 # ── Answer / confidence extraction ───────────────────────────────────────────
 
+def _strip_think(text: str) -> str:
+    """
+    Remove <think>...</think> blocks from text.
+    If the opening tag has no matching closing tag (truncated generation),
+    strip everything from <think> to end-of-string so partial thinking
+    content cannot pollute extraction.
+    """
+    # Remove complete blocks first
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove any unclosed block (truncated mid-generation)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def extract_selected_option(text: str, options: list[str]) -> Optional[str]:
     """
     Priority:
       1. Explicit 'Selected Option: X' label
       2. First option string found verbatim in clean text
-    Strips <think> blocks before matching.
+    Strips <think> blocks (including unterminated ones) before matching.
     """
     if not text:
         return None
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip() or text
+    clean = _strip_think(text)
+    if not clean:
+        return None
     m = re.search(r"Selected Option[:\s]+(.+?)(?:\n|$)", clean, re.IGNORECASE)
     if m:
         candidate = m.group(1).strip().rstrip(".,;")
@@ -60,15 +77,25 @@ def extract_selected_option(text: str, options: list[str]) -> Optional[str]:
 
 
 def extract_reflection(text: str) -> Optional[str]:
-    """Extract the last Reflection block from the agent output, if present."""
+    """
+    Extract the last Reflection block from the agent output.
+    Searches visible text first; falls back to inside <think> if not found.
+    Qwen3 sometimes puts the reflection block inside <think> despite instructions.
+    """
     if not text:
         return None
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Grab the last occurrence — most recent reflection is most informative
-    matches = list(re.finditer(r"Reflection:(.*?)(?=\n(?:Reflection:|Reasoning:|Final Answer:|Selected Option:|$))",
-                               clean, re.DOTALL | re.IGNORECASE))
+    _pattern = r"Reflection:(.*?)(?=\n(?:Reflection:|Reasoning:|Final Answer:|Selected Option:)|$)"
+    # Primary: visible text (outside <think>)
+    clean = _strip_think(text)
+    matches = list(re.finditer(_pattern, clean, re.DOTALL | re.IGNORECASE))
     if matches:
         return matches[-1].group(1).strip()
+    # Fallback: inside <think> block
+    think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    if think_match:
+        matches = list(re.finditer(_pattern, think_match.group(1), re.DOTALL | re.IGNORECASE))
+        if matches:
+            return matches[-1].group(1).strip()
     return None
 
 
@@ -76,7 +103,7 @@ def extract_self_critique(text: str) -> Optional[str]:
     """Extract Self-critique line from the final answer block."""
     if not text:
         return None
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    clean = _strip_think(text)
     m = re.search(r"Self-critique[:\s]+(.+?)(?=\nFinal Answer:|\nSelected Option:|$)",
                   clean, re.DOTALL | re.IGNORECASE)
     if m:
@@ -88,7 +115,7 @@ def extract_confidence(text: str) -> Optional[float]:
     """Parse 'Confidence: 0.75' → float in [0.0, 1.0] or None."""
     if not text:
         return None
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    clean = _strip_think(text)
     m = re.search(r"Confidence[:\s]+([\d.]+)", clean, re.IGNORECASE)
     if m:
         try:
@@ -107,14 +134,57 @@ def _alarm_handler(signum, frame):
     raise _Timeout()
 
 
-# ── Per-question runner ───────────────────────────────────────────────────────
+# ── Per-question runners ──────────────────────────────────────────────────────
 
 def run_single(question: str, options: list[str], cutoff_time: str,
-               timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> dict:
+               timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+               reflection: bool = False) -> dict:
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(timeout_sec)
     try:
-        return run_react(question, options, cutoff_time)
+        return run_react(question, options, cutoff_time, reflection=reflection)
+    except _Timeout:
+        return {"final_answer": "", "tool_call_count": 0,
+                "latency_sec": float(timeout_sec), "error": "TIMEOUT"}
+    except Exception as e:
+        return {"final_answer": "", "tool_call_count": 0, "latency_sec": 0.0, "error": str(e)}
+    finally:
+        signal.alarm(0)
+
+
+def run_zero_shot(question: str, options: list[str], cutoff_time: str,
+                  timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> dict:
+    """Single LLM call with no tools — pure zero-shot baseline."""
+    from shared.llm import get_client, get_model
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(timeout_sec)
+    start = time.time()
+    try:
+        client = get_client()
+        model  = get_model()
+        options_str = ", ".join(options)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": ZERO_SHOT_SYSTEM_PROMPT},
+                {"role": "user", "content": (
+                    f"Question: {question}\n"
+                    f"Options: {options_str}\n"
+                    f"Cutoff Date: {cutoff_time}\n\n"
+                    f"You MUST select exactly one of the provided options as your final answer."
+                )},
+            ],
+            temperature=0.1,
+            max_tokens=4096,
+        )
+        choice = response.choices[0]
+        error  = "TOKEN_LIMIT" if choice.finish_reason == "length" else None
+        return {
+            "final_answer":    choice.message.content or "",
+            "tool_call_count": 0,
+            "latency_sec":     round(time.time() - start, 2),
+            "error":           error,
+        }
     except _Timeout:
         return {"final_answer": "", "tool_call_count": 0,
                 "latency_sec": float(timeout_sec), "error": "TIMEOUT"}
@@ -215,9 +285,11 @@ def benchmark_timeseries(
     timeout_sec: int,
     max_timepoints: Optional[int],
     dataset_path: Path,
+    reflection: bool = False,
+    zero_shot: bool = False,
 ) -> None:
     """
-    Run the agent at every historical price timepoint per question.
+    Run the agent (or zero-shot LLM) at every historical price timepoint per question.
 
     For each (question, timepoint):
       - Agent receives timepoint_date as cutoff — NOT the close/resolution date.
@@ -251,15 +323,20 @@ def benchmark_timeseries(
                 completed_timepoints += 1
                 continue
 
-            print(f"[Q{i+1}/{len(dataset)} T{t_idx+1}/{n_timepoints}] "
+            mode_tag = "ZS" if zero_shot else ("R+ref" if reflection else "R")
+            print(f"[Q{i+1}/{len(dataset)} T{t_idx+1}/{n_timepoints}] [{mode_tag}] "
                   f"{item['question'][:70]}...  cutoff={tp['date']}")
 
             # Agent receives the timepoint date — close_date is intentionally withheld
-            result = run_single(item["question"], item["options"], tp["date"], timeout_sec)
+            if zero_shot:
+                result = run_zero_shot(item["question"], item["options"], tp["date"], timeout_sec)
+            else:
+                result = run_single(item["question"], item["options"], tp["date"],
+                                    timeout_sec, reflection=reflection)
 
             predicted     = extract_selected_option(result["final_answer"], item["options"])
             confidence    = extract_confidence(result["final_answer"])
-            reflection    = extract_reflection(result["final_answer"])
+            refl_text     = extract_reflection(result["final_answer"])
             self_critique = extract_self_critique(result["final_answer"])
             correct       = (predicted == item["ground_truth"]) if predicted is not None else None
 
@@ -299,12 +376,12 @@ def benchmark_timeseries(
                 "confidence":        confidence,
                 "agent_prob_yes":    agent_prob_yes,
                 "agent_prob_no":     agent_prob_no,
-                "reflection":        reflection,
+                "reflection":        refl_text,
                 "self_critique":     self_critique,
                 "tool_call_count":   result["tool_call_count"],
                 "latency_sec":       result["latency_sec"],
                 "error":             result["error"],
-                "timestamp":         datetime.utcnow().isoformat(),
+                "timestamp":         datetime.now(timezone.utc).isoformat(),
                 "final_answer":      result["final_answer"],
             })
             done.add(resume_key)
@@ -316,7 +393,8 @@ def benchmark_timeseries(
 
 # ── Main benchmark loop ───────────────────────────────────────────────────────
 
-def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int) -> None:
+def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int,
+              reflection: bool = False, zero_shot: bool = False) -> None:
     dataset = load_polymarket(DATASET_PATH, max_questions)
     done    = load_completed(results_file)
 
@@ -332,16 +410,21 @@ def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int
         if question_id in done:
             continue
 
-        print(f"[Q{i+1}/{len(dataset)}] {item['question'][:80]}...")
+        mode_tag = "ZS" if zero_shot else ("R+ref" if reflection else "R")
+        print(f"[Q{i+1}/{len(dataset)}] [{mode_tag}] {item['question'][:75]}...")
 
-        result = run_single(item["question"], item["options"],
-                            item["cutoff_date"], timeout_sec)
+        if zero_shot:
+            result = run_zero_shot(item["question"], item["options"],
+                                   item["cutoff_date"], timeout_sec)
+        else:
+            result = run_single(item["question"], item["options"],
+                                item["cutoff_date"], timeout_sec, reflection=reflection)
 
-        predicted    = extract_selected_option(result["final_answer"], item["options"])
-        confidence   = extract_confidence(result["final_answer"])
-        reflection   = extract_reflection(result["final_answer"])
-        self_critique= extract_self_critique(result["final_answer"])
-        correct      = (predicted == item["ground_truth"]) if predicted is not None else None
+        predicted     = extract_selected_option(result["final_answer"], item["options"])
+        confidence    = extract_confidence(result["final_answer"])
+        refl_text     = extract_reflection(result["final_answer"])
+        self_critique = extract_self_critique(result["final_answer"])
+        correct       = (predicted == item["ground_truth"]) if predicted is not None else None
 
         if confidence is not None and predicted == "Yes":
             agent_prob_yes, agent_prob_no = confidence, round(1.0 - confidence, 4)
@@ -371,12 +454,12 @@ def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int
             "agent_prob_no":   agent_prob_no,
             "market_prob_yes": item.get("market_prob_yes"),
             "market_prob_no":  item.get("market_prob_no"),
-            "reflection":      reflection,
+            "reflection":      refl_text,
             "self_critique":   self_critique,
             "tool_call_count": result["tool_call_count"],
             "latency_sec":     result["latency_sec"],
             "error":           result["error"],
-            "timestamp":       datetime.utcnow().isoformat(),
+            "timestamp":       datetime.now(timezone.utc).isoformat(),
             "final_answer":    result["final_answer"],
         })
         done.add(question_id)
@@ -388,7 +471,7 @@ def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate ReAct agent on Polymarket dataset")
+    parser = argparse.ArgumentParser(description="Evaluate forecasting agent on Polymarket dataset")
     parser.add_argument("--max_questions",  type=int, default=None,
                         help="Limit number of questions (default: all)")
     parser.add_argument("--results_file",   type=str, default=None,
@@ -398,28 +481,41 @@ if __name__ == "__main__":
     parser.add_argument("--summarize",      type=str, default=None, metavar="FILE",
                         help="Print summary from an existing results file and exit")
     parser.add_argument("--timeseries",     action="store_true",
-                        help="Run agent at every historical price timepoint per question")
+                        help="Run at every historical price timepoint per question")
     parser.add_argument("--max_timepoints", type=int, default=None,
-                        help="Max evenly-spaced timepoints per question (default: all). "
-                             "Recommended: omit on first run to collect full data.")
+                        help="Max evenly-spaced timepoints per question (default: all)")
     parser.add_argument("--dataset",        type=str, default=None,
                         help="Path to dataset JSONL (default: polymarket_binary_yesno.jsonl)")
+    parser.add_argument("--reflection",     action="store_true",
+                        help="Enable structured reflection in ReAct prompt (ablation condition)")
+    parser.add_argument("--zero_shot",      action="store_true",
+                        help="Zero-shot baseline: single LLM call, no tools or retrieval")
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset) if args.dataset else DATASET_PATH
 
+    # Build result file prefix from active modes
+    if not args.results_file:
+        parts = ["results"]
+        if args.zero_shot:
+            parts.append("zs")
+        if args.reflection:
+            parts.append("r")
+        if args.timeseries:
+            parts.append("ts")
+        prefix = "_".join(parts)
+        auto_file = RESULTS_DIR / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+    else:
+        auto_file = None
+
     if args.summarize:
         summarize(Path(args.summarize))
     elif args.timeseries:
-        results_file = (
-            Path(args.results_file) if args.results_file
-            else RESULTS_DIR / f"results_ts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-        )
+        results_file = Path(args.results_file) if args.results_file else auto_file
         benchmark_timeseries(args.max_questions, results_file, args.timeout,
-                             args.max_timepoints, dataset_path)
+                             args.max_timepoints, dataset_path,
+                             reflection=args.reflection, zero_shot=args.zero_shot)
     else:
-        results_file = (
-            Path(args.results_file) if args.results_file
-            else RESULTS_DIR / f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-        )
-        benchmark(args.max_questions, results_file, args.timeout)
+        results_file = Path(args.results_file) if args.results_file else auto_file
+        benchmark(args.max_questions, results_file, args.timeout,
+                  reflection=args.reflection, zero_shot=args.zero_shot)

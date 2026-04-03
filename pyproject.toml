@@ -8,3 +8,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "vllm>=0.16.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "database*", "shared*", "d_agent_client*", "eval*"]

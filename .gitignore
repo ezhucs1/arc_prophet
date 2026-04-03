@@ -17,3 +17,11 @@ database/*.jsonl
 
 # Eval results
 agent/results/*.jsonl
+
+# Runtime logs
+*.log
+logs/
+nohup.out
+
+# Scratch files
+clipboard.txt

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shared.llm import get_client, get_model
 from agent.tools import TOOL_MAP, TOOL_SCHEMAS
-from agent.prompts import REACT_SYSTEM_PROMPT
+from agent.prompts import REACT_SYSTEM_PROMPT, REACT_SYSTEM_PROMPT_REFLECTION
 
 
 def run_react(
@@ -22,6 +22,7 @@ def run_react(
     options: list[str],
     cutoff_time: str,
     max_iterations: int = 20,
+    reflection: bool = False,
 ) -> dict:
     """
     Run the ReAct loop for one question.
@@ -32,9 +33,10 @@ def run_react(
         latency_sec     (float)      — wall-clock seconds
         error           (str | None) — error message if failed, else None
     """
+    system_prompt = REACT_SYSTEM_PROMPT_REFLECTION if reflection else REACT_SYSTEM_PROMPT
     options_str = ", ".join(options)
     messages = [
-        {"role": "system", "content": REACT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": (
             f"Question: {question}\n"
             f"Options: {options_str}\n"
@@ -55,9 +57,20 @@ def run_react(
                 messages=messages,
                 tools=TOOL_SCHEMAS,
                 temperature=0.1,
-                max_tokens=1024,
+                max_tokens=4096,
             )
-            msg = response.choices[0].message
+            choice = response.choices[0]
+            msg    = choice.message
+
+            # Truncated generation: tool call JSON was cut off mid-stream,
+            # causing hermes_tool_parser to silently drop the tool calls.
+            if choice.finish_reason == "length":
+                return {
+                    "final_answer":    msg.content or "",
+                    "tool_call_count": tool_call_count,
+                    "latency_sec":     round(time.time() - start, 2),
+                    "error":           "TOKEN_LIMIT",
+                }
 
             assistant_turn = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
