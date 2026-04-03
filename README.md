@@ -75,11 +75,6 @@ Create a `.env` file in the project root:
 ```env
 VLLM_API_BASE=http://127.0.0.1:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen3-14B-AWQ
-
-# Optional: Langfuse tracing
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_HOST=https://us.cloud.langfuse.com
 ```
 
 ## Usage
