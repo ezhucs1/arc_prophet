@@ -1,322 +1,236 @@
-# P-Agent: ReAct Forecasting Agent
+# ARC — Agent Research & Curation
 
-A minimal ReAct agent that answers binary (Yes/No) prediction questions by
-searching a Reddit corpus via semantic + full-text retrieval, then generating a
-probability estimate. Built for evaluation against the Polymarket dataset as part
-of a research paper on LLM-based forecasting.
+A ReAct agent evaluation system for binary forecasting on Polymarket questions.
+The agent answers yes/no prediction market questions by searching a Reddit knowledge base,
+and is evaluated in a time-series manner — once per historical price timepoint per question —
+to compare agent probability estimates against human (market) probabilities over time.
 
-No LangChain. No LangGraph. No LangFuse. Just Python + OpenAI API + a while-loop.
+## Overview
 
----
+```
+Polymarket JSONL dataset
+        ↓
+agent/evals.py          ← benchmark harness (single-pass or time-series)
+        ↓ per question / per timepoint
+agent/react_agent.py    ← ReAct while-loop (LLM + tools, max 20 iterations)
+        ↓
+shared/llm.py           ← OpenAI-compatible client (vLLM / Qwen3-14B-AWQ)
+        ↓ tool calls
+agent/tools.py          ← 5 tools: search, post, comment, thread, author history
+        ↓
+d_agent_client/client.py ← IPC TCP client → Text2SQL server → Reddit DB
+        ↓
+agent/results/*.jsonl   ← one record per (question, timepoint)
+        ↓ optional
+eval/eval_forecasting.py ← calibration, classification, operational metrics
+```
 
 ## Project Structure
 
 ```
-p_agent_workspace/
-│
+arc/
 ├── agent/
-│   ├── agent.py       ReAct while-loop — call LLM → tools → repeat
-│   ├── tools.py       5 d_agent IPC tools + OpenAI function schemas
-│   ├── prompts.py     System prompt (subreddit routing, output format)
-│   └── evals.py       Benchmark harness + metrics summary
-│
-├── shared/
-│   └── llm.py         OpenAI client pointed at local vLLM server
-│
+│   ├── react_agent.py      # ReAct loop: LLM → tool calls → repeat → final answer
+│   ├── tools.py            # 5 OpenAI-schema tools for Reddit DB access
+│   ├── prompts.py          # System prompt: reasoning discipline + reflection
+│   ├── evals.py            # Benchmark harness: single-pass and time-series modes
+│   └── results/            # Output JSONL files (gitignored)
 ├── database/
-│   ├── loader.py      Loads Polymarket JSONL → question dicts
-│   └── polymarket_binary_yesno.jsonl   (31 K questions, ~345 MB)
-│
-├── d_agent_client/    IPC client for PostgreSQL + pgvector Reddit database
-│
+│   ├── loader.py           # Polymarket dataset loaders
+│   ├── polymarket_binary_yesno.jsonl         # All binary markets (~361 MB, gitignored)
+│   ├── polymarket_binary_weekly_plus.jsonl   # Markets open ≥1 week (~212 MB, gitignored)
+│   ├── polymarket_binary_monthly_plus.jsonl  # Markets open ≥1 month (~47 MB, gitignored)
+│   └── polymarket_binary_yearly_plus.jsonl   # Markets open ≥1 year (~382 KB, gitignored)
+├── d_agent_client/
+│   └── client.py           # IPC TCP client to Text2SQL server (127.0.0.1:61001)
 ├── eval/
-│   └── eval_forecasting.py   Post-run metrics (Brier, F1, calibration, topics)
-│
-├── run.py             Interactive single-query entry point
-├── .env               API base URL, model name, secrets
-└── requirements.txt   openai, python-dotenv
+│   └── eval_forecasting.py # Full metrics: Brier, ECE, MCC, F1, per-topic breakdown
+├── shared/
+│   └── llm.py              # LLM client init from .env
+├── run.py                  # Single interactive query CLI
+├── pyproject.toml
+└── requirements.txt
 ```
-
----
-
-## How It Works
-
-```
-Question + cutoff_date
-        │
-        ▼
-  agent/agent.py  ──── run_react() while-loop ────────────────────────────┐
-        │                                                                   │
-        │  1. Build messages = [system_prompt, user_question]              │
-        │  2. Call vLLM via OpenAI API  ──► LLM returns tool_calls?        │
-        │         Yes ──► execute tool via d_agent_client                  │
-        │                 append result to messages                         │
-        │                 loop back                                         │
-        │         No  ──► extract final_answer (contains Confidence score) │
-        │                                                                   │
-        ▼                                                                   │
-  Output dict ◄──────────────────────────────────────────────────────────┘
-    final_answer    raw LLM text
-    tool_call_count number of d_agent calls made
-    latency_sec     wall-clock time
-    error           None or error string
-
-        │
-        ▼
-  agent/evals.py  ──── extract_selected_option()  →  "Yes" / "No"
-                  ──── extract_confidence()        →  0.0 – 1.0
-                  ──── derive agent_prob_yes/no    →  complement pair
-                  ──── compare to ground_truth     →  correct: bool
-                  ──── write JSONL record
-```
-
-The d_agent server is a separate service that wraps a PostgreSQL + pgvector
-database of Reddit posts and comments. The agent queries it up to the
-`cutoff_date` so it cannot see future information.
-
----
-
-## JSONL Output Schema
-
-Each evaluated question produces one record:
-
-```json
-{
-  "question_id":     "42",
-  "question":        "Will SEC approve the first spot Bitcoin ETF by Jan 8 2024?",
-  "options":         ["Yes", "No"],
-  "ground_truth":    "Yes",
-  "cutoff_date":     "2024-01-08",
-  "topic":           "",
-  "final_answer":    "Reasoning: ...\nSelected Option: Yes\nConfidence: 0.82",
-  "predicted":       "Yes",
-  "correct":         true,
-  "confidence":      0.82,
-  "agent_prob_yes":  0.82,
-  "agent_prob_no":   0.18,
-  "market_prob_yes": 0.75,
-  "market_prob_no":  0.25,
-  "tool_call_count": 4,
-  "latency_sec":     23.5,
-  "error":           null,
-  "timestamp":       "2026-04-02T10:00:00"
-}
-```
-
-`agent_prob_yes/no` — the agent's own probability estimate from Reddit evidence  
-`market_prob_yes/no` — the Polymarket crowd's implied probability at `cutoff_date`
-
----
 
 ## Setup
 
-### 1. Clone and install
+### Requirements
+
+- Python 3.12
+- vLLM server running locally (default: `http://127.0.0.1:8000/v1`)
+- Text2SQL IPC server running locally (default: `127.0.0.1:61001`)
+
+### Install
 
 ```bash
-git clone <repo-url>
-cd p_agent_workspace
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure `.env`
+### Environment
 
-```bash
-cp .env.example .env   # or edit .env directly
-```
+Create a `.env` file in the project root:
 
-```ini
-# .env
+```env
 VLLM_API_BASE=http://127.0.0.1:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen3-14B-AWQ
+
+# Optional: Langfuse tracing
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_HOST=https://us.cloud.langfuse.com
 ```
 
-### 3. Start the vLLM server (GPU required)
+## Usage
 
-The agent uses **Qwen3-14B-AWQ** served via vLLM. Start it once before running
-any evaluation.
-
-If you have multiple GPUs, set `CUDA_VISIBLE_DEVICES` to pick a specific one
-before launching the server. Check available GPUs first:
+### Single interactive query
 
 ```bash
-nvidia-smi
+python run.py --query "Will Bitcoin hit 100k by Feb 2026?" --cutoff_time 2026-02-01
+python run.py --query "Will inflation drop below 3%?" --cutoff_time 2026-01-01 --options Yes No
 ```
 
-Then start the server on the desired GPU (replace `0` with the GPU index you
-want to use):
+### Single-pass benchmark (one result per question)
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 nohup python -m vllm.entrypoints.openai.api_server \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --model Qwen/Qwen3-14B-AWQ \
-  --quantization awq \
-  --max-model-len 16384 \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --enforce-eager \
-  --generation-config vllm \
-  > vllm.log 2>&1 &
-```
-
-To use a different GPU, change the index — e.g. `CUDA_VISIBLE_DEVICES=1` for
-GPU 1, `CUDA_VISIBLE_DEVICES=2` for GPU 2, and so on.
-
-Wait for the server to be ready (check `vllm.log` for `"Application startup complete"`):
-
-```bash
-tail -f vllm.log
-# Or health-check:
-curl http://127.0.0.1:8000/health
-```
-
-To stop the server:
-```bash
-pkill -f "vllm.entrypoints.openai.api_server"
-```
-
-### 4. Start the D-Agent server
-
-The D-Agent serves the Reddit PostgreSQL + pgvector database over IPC:
-
-```bash
-# Start d_agent server (separate process, keep running during eval)
-python d_agent_client/client.py --tcp 127.0.0.1:61001 --authkey secret123 --ping
-```
-
----
-
-## Running the Agent
-
-### Interactive single query
-
-```bash
-python run.py \
-  --query "Will Bitcoin reach $100k by February 2026?" \
-  --cutoff_time 2026-02-01
-
-# Custom options
-python run.py \
-  --query "Will the Fed cut rates in March 2025?" \
-  --cutoff_time 2025-03-01 \
-  --options "Yes" "No"
-```
-
-### Benchmark evaluation
-
-```bash
-# Quick smoke test — 10 questions
+# Run 10 questions
 python agent/evals.py --max_questions 10
 
-# Larger run — 100 questions
-python agent/evals.py --max_questions 100
-
-# Full dataset
+# Run full dataset
 python agent/evals.py
 
-# Resume an interrupted run
-python agent/evals.py --results_file agent/results/results_20260402_120000.jsonl
+# Resume from existing results file
+python agent/evals.py --results_file agent/results/results_XXXXXX.jsonl
 
-# Longer timeout per question (default 300s)
-python agent/evals.py --max_questions 100 --timeout 600
-```
-
-Results are saved incrementally to `agent/results/results_YYYYMMDD_HHMMSS.jsonl`.
-If the run is interrupted, re-run the same command with `--results_file` to resume
-from where it left off (already-completed questions are skipped).
-
-### View summary
-
-```bash
+# Summarize existing results
 python agent/evals.py --summarize agent/results/results_XXXXXX.jsonl
 ```
 
-Output:
-```
-=======================================================
-Results: results_20260402_120000.jsonl
-=======================================================
-  Total questions : 100
-  Answered        : 97
-  Correct         : 68
-  Accuracy        : 70.1%
-  Errors          : 2
-  Timeouts        : 1
-  Avg tool calls  : 4.3
-  Avg latency     : 24.7s
-  Avg confidence  : 0.714
-=======================================================
-```
-
----
-
-## Evaluation Process
-
-### Step 1 — Run benchmark
+### Time-series benchmark (one result per question per timepoint)
 
 ```bash
-python agent/evals.py --max_questions 200
+# Full time series — recommended for first run to collect all data
+python agent/evals.py --timeseries --max_questions 10
+
+# Cap timepoints per question (evenly spaced)
+python agent/evals.py --timeseries --max_questions 100 --max_timepoints 10
+
+# Use a different dataset (weekly/monthly/yearly)
+python agent/evals.py --timeseries --dataset database/polymarket_binary_monthly_plus.jsonl
+
+# Resume a time-series run
+python agent/evals.py --timeseries --results_file agent/results/results_ts_XXXXXX.jsonl
+
+# Custom timeout per timepoint (default: 300s)
+python agent/evals.py --timeseries --max_questions 50 --timeout 180
 ```
 
-### Step 2 — Full metrics (Brier score, calibration, topic breakdown)
+Time-series result files are named `results_ts_YYYYMMDD_HHMMSS.jsonl` to distinguish them
+from single-pass results (`results_YYYYMMDD_HHMMSS.jsonl`).
+
+### Comprehensive metrics analysis
 
 ```bash
-python eval/eval_forecasting.py agent/results/results_XXXXXX.jsonl
-# Export to JSON
-python eval/eval_forecasting.py agent/results/results_XXXXXX.jsonl --output metrics.json
-# Export to CSV
-python eval/eval_forecasting.py agent/results/results_XXXXXX.jsonl --format csv --output metrics.csv
+python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl
+python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl --output report.json
+python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl --format all --output-dir ./eval_results/
 ```
 
-Metrics computed:
-- **Accuracy** — fraction correct (Yes/No)
-- **Precision / Recall / F1** — binary classification quality
-- **MCC / Cohen's Kappa** — balanced accuracy for imbalanced datasets
-- **Brier Score** — probability calibration (`agent_prob_yes` vs ground truth)
-- **Log Loss** — probabilistic accuracy
-- **ECE** — expected calibration error
-- **Topic-level breakdown** — per-category accuracy
-- **Operational** — avg tool calls, avg latency, error/timeout rates
+## Output Schema
 
-### Probability trajectory evaluation (timeline mode)
+### Single-pass result record
 
-Each Polymarket question has daily price snapshots (`history_prices`). Running
-the agent at multiple cutoff dates per question shows how the agent's probability
-estimate evolves as the event approaches — comparable to the market's price curve.
+| Field | Description |
+|---|---|
+| `question_id` | Sequential question index |
+| `question` | Question text |
+| `options` | Always `["Yes", "No"]` |
+| `ground_truth` | Resolved market outcome |
+| `cutoff_date` | Market close date (agent's cutoff) |
+| `topic` | Market category |
+| `predicted` | Agent's selected option |
+| `correct` | Whether prediction matches ground truth |
+| `confidence` | Agent's stated confidence (0.0–1.0) |
+| `agent_prob_yes` / `agent_prob_no` | Agent probabilities derived from confidence |
+| `market_prob_yes` / `market_prob_no` | Human market probability at close date |
+| `reflection` | Last reflection block from agent reasoning |
+| `self_critique` | Agent's pre-commit counter-argument |
+| `tool_call_count` | Number of tool calls made |
+| `latency_sec` | Wall-clock seconds |
+| `error` | Error message or `null` |
+| `timestamp` | UTC timestamp of record creation |
+| `final_answer` | Raw LLM output (reasoning + answer) |
+
+### Time-series result record
+
+Same as above, with these differences/additions:
+
+| Field | Description |
+|---|---|
+| `timepoint_index` | Position in the time series (1-based) |
+| `timepoint_date` | Date used as agent's cutoff (NOT the close date) |
+| `total_timepoints` | Total timepoints for this question |
+| `close_date` | Market resolution date (stored for reference, never sent to agent) |
+| `human_prob_yes` / `human_prob_no` | Market probability at this specific timepoint |
+
+## Agent Design
+
+### ReAct Loop (`agent/react_agent.py`)
+
+Plain while-loop, no frameworks. Each iteration:
+1. Call LLM with accumulated messages + tool schemas
+2. If response has tool calls → execute → append results → continue
+3. If no tool calls → return final answer
+
+Max 20 iterations. 300-second timeout per question/timepoint.
+
+### Tools (`agent/tools.py`)
+
+| Tool | Purpose |
+|---|---|
+| `search_database` | Hybrid semantic + keyword search across Reddit posts/comments |
+| `get_post_core_info` | Full content and metadata for a specific post |
+| `get_comment_core_info` | Full content and metadata for a specific comment |
+| `get_post_comments_list` | Thread context around a comment (ancestors + descendants) |
+| `get_author_history_list` | Chronological post/comment history for an author |
+
+All tools respect `cutoff_time` — results are filtered to dates before the cutoff.
+
+### Reflection (`agent/prompts.py`)
+
+The agent is instructed to produce a structured `Reflection:` block every 3 tool calls:
 
 ```
-Date points from history_prices:
-  Feb 04  market=0.26  →  agent runs with cutoff=Feb 04  →  agent_prob_yes=?
-  Feb 10  market=0.31  →  agent runs with cutoff=Feb 10  →  agent_prob_yes=?
-  Feb 20  market=0.16  →  agent runs with cutoff=Feb 20  →  agent_prob_yes=?
-  Feb 26  market=0.98  →  agent runs with cutoff=Feb 26  →  agent_prob_yes=?
+Reflection:
+  Evidence for Yes: ...
+  Evidence for No: ...
+  Gaps / uncertainties: ...
+  Current belief: Yes=0.X | No=0.X
+  Next action: GATHER MORE — reason | CONCLUDE — reason
 ```
 
-This produces a per-question probability time-series for agent vs. market
-comparison, which is the core evaluation contribution for the research paper.
+Before the final answer, the agent also writes a `Self-critique:` — the strongest
+counter-argument to its conclusion, with an explicit check for absence-of-evidence
+vs evidence-of-absence confusion.
 
----
+Both fields are extracted and stored in the result record for research analysis.
 
-## Key Design Decisions
+### Datasets
 
-| Decision | Rationale |
-|----------|-----------|
-| No LangGraph / LangFuse | A ReAct loop is a `while` loop. Frameworks add ~4 dependencies and ~500 lines for no functional gain. |
-| Fresh IPC connection per tool call | Prevents stale-connection errors on long-running GPU queries. |
-| `Confidence:` in output format | Converts binary Yes/No to a calibrated probability, enabling Brier score and log-loss evaluation. |
-| `agent_prob_yes` = complement of `agent_prob_no` | Yes + No probabilities always sum to 1.0. Market prices confirm this (Yes price + No price ≈ 1.0). |
-| `cutoff_time` on every d_agent call | Strict data leakage prevention — agent can only use Reddit posts published before the cutoff date. |
-| Subreddit routing in prompt | Narrows search to the most relevant community (e.g., CryptoCurrency for Bitcoin questions), improving evidence quality. |
-| max_tokens=1024, temp=0.1 | Deterministic, concise responses within the 16 384-token context window. |
+All datasets are Polymarket binary yes/no markets with daily `history_prices` snapshots.
+The `_plus` variants filter for markets that were open for at least that duration,
+giving questions with more historical timepoints.
 
----
+| Dataset | Size | Description |
+|---|---|---|
+| `polymarket_binary_yesno.jsonl` | ~361 MB | All binary markets |
+| `polymarket_binary_weekly_plus.jsonl` | ~212 MB | Markets open ≥1 week |
+| `polymarket_binary_monthly_plus.jsonl` | ~47 MB | Markets open ≥1 month |
+| `polymarket_binary_yearly_plus.jsonl` | ~382 KB | Markets open ≥1 year |
 
-## Dependencies
+### Data Leakage Prevention
 
-```
-openai          OpenAI-compatible client → points at local vLLM
-python-dotenv   Load .env config
-vllm            (server only, not imported by agent code)
-```
-
-The `d_agent_client/` package is a local IPC client — no pip install needed.
+In time-series mode, the agent receives only the **timepoint date** as its cutoff —
+the market's close/resolution date is never passed to the agent. This prevents the
+agent from searching for news about the outcome on or after resolution day.
