@@ -158,21 +158,77 @@ class OperationalMetrics:
     p90_latency_sec: float = 0.0
     p95_latency_sec: float = 0.0
     p99_latency_sec: float = 0.0
-    
+
     # Tool usage
     avg_tool_calls: float = 0.0
     median_tool_calls: float = 0.0
     max_tool_calls: int = 0
     zero_tool_call_rate: float = 0.0
-    
+
     # Errors
     total_errors: int = 0
     error_rate: float = 0.0
-    timeout_rate: float = 0.0  # Recursion limit errors
-    token_overflow_rate: float = 0.0  # Context length errors
-    
+    timeout_rate: float = 0.0
+    token_limit_rate: float = 0.0   # finish_reason=length or TOKEN_LIMIT
+    context_overflow_rate: float = 0.0  # 400 context window exceeded
+
     # Error breakdown
     error_types: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class TimeSeriesMetrics:
+    """Metrics for time-series evaluation (multiple timepoints per question)."""
+    available: bool = False
+    n_questions: int = 0
+    n_total_timepoints: int = 0
+    avg_timepoints_per_question: float = 0.0
+
+    # Accuracy at different positions in the timeline
+    accuracy_first_timepoint: Optional[float] = None   # earliest available date
+    accuracy_last_timepoint: Optional[float] = None    # closest to resolution
+    accuracy_early_half: Optional[float] = None        # timepoint_index <= median
+    accuracy_late_half: Optional[float] = None         # timepoint_index > median
+
+    # Per-question consistency: does the agent agree with itself across timepoints?
+    consistency_rate: float = 0.0        # fraction of questions where all timepoints agree
+    majority_vote_accuracy: float = 0.0  # accuracy using per-question majority vote
+
+
+@dataclass
+class MarketComparisonMetrics:
+    """Compare agent probability estimates against prediction market (human) probabilities."""
+    available: bool = False
+    n_samples: int = 0
+
+    # Brier scores on P(Yes) — lower is better, perfect = 0, random = 0.25
+    agent_brier_score: Optional[float] = None
+    market_brier_score: Optional[float] = None
+    brier_skill_score: Optional[float] = None  # 1 - (agent_BS / market_BS); >0 means agent beats market
+
+    # Probability alignment
+    prob_correlation: Optional[float] = None       # Pearson r(agent_prob_yes, human_prob_yes)
+    mean_absolute_deviation: Optional[float] = None  # avg |agent_prob_yes - human_prob_yes|
+
+    # Directional agreement: both sides of 0.5 threshold
+    directional_agreement_rate: Optional[float] = None  # agent and market agree on which side of 50%
+
+
+@dataclass
+class ReflectionQualityMetrics:
+    """Metrics about reflection and self-critique content in outputs."""
+    available: bool = False
+    n_total: int = 0
+    n_with_reflection: int = 0
+    n_with_self_critique: int = 0
+    reflection_rate: float = 0.0
+    self_critique_rate: float = 0.0
+
+    # Accuracy split: does having a reflection or self-critique correlate with better accuracy?
+    accuracy_with_reflection: Optional[float] = None
+    accuracy_without_reflection: Optional[float] = None
+    accuracy_with_self_critique: Optional[float] = None
+    accuracy_without_self_critique: Optional[float] = None
 
 
 @dataclass
@@ -203,15 +259,24 @@ class EvaluationReport:
     timestamp: str = ""
     input_file: str = ""
     total_questions: int = 0
-    
+
     # Core metrics
     classification: BinaryClassificationMetrics = field(default_factory=BinaryClassificationMetrics)
     calibration: CalibrationMetrics = field(default_factory=CalibrationMetrics)
     operational: OperationalMetrics = field(default_factory=OperationalMetrics)
-    
+
+    # Time-series specific (populated when timepoint fields are present)
+    timeseries: TimeSeriesMetrics = field(default_factory=TimeSeriesMetrics)
+
+    # Market comparison (populated when human_prob_yes fields are present)
+    market_comparison: MarketComparisonMetrics = field(default_factory=MarketComparisonMetrics)
+
+    # Reflection quality (populated when reflection/self_critique fields are present)
+    reflection_quality: ReflectionQualityMetrics = field(default_factory=ReflectionQualityMetrics)
+
     # Breakdown by topic
     by_topic: Dict[str, TopicMetrics] = field(default_factory=dict)
-    
+
     # Error analysis
     common_error_patterns: Dict[str, int] = field(default_factory=dict)
 
@@ -336,81 +401,78 @@ def compute_classification_metrics(data: List[Dict]) -> BinaryClassificationMetr
     return metrics
 
 
-def extract_confidence(record: Dict) -> Optional[float]:
+def extract_prob_yes_from_record(record: Dict) -> Optional[float]:
     """
-    Extract confidence score from a record.
-    
-    Checks:
-    1. Direct 'confidence' field
-    2. Direct 'prob_yes' field
-    3. Patterns in 'final_answer' text
+    Extract P(Yes) — the probability that Yes is the correct answer — from a record.
+
+    Priority:
+    1. agent_prob_yes field (pre-computed, always P(Yes))
+    2. P(Yes): label in final_answer text (new prompt format)
+    3. Legacy: Confidence field + predicted direction (old prompt format)
+       - if predicted=Yes: P(Yes) = confidence
+       - if predicted=No:  P(Yes) = 1 - confidence
     """
-    # Direct fields
-    if 'confidence' in record and record['confidence'] is not None:
-        return float(record['confidence'])
-    
-    if 'prob_yes' in record and record['prob_yes'] is not None:
-        return float(record['prob_yes'])
-    
-    if 'probability' in record and record['probability'] is not None:
-        return float(record['probability'])
-    
-    # Extract from text
+    # 1. Pre-computed field — most reliable
+    if record.get('agent_prob_yes') is not None:
+        return float(record['agent_prob_yes'])
+
     final_answer = record.get('final_answer', '')
-    if not final_answer:
-        return None
-    
-    patterns = [
-        r'[Cc]onfidence[:\s]+(\d+\.?\d*)%',
-        r'[Cc]onfidence[:\s]+(\d+\.?\d*)',
-        r'(\d+\.?\d*)%\s*confident',
-        r'[Pp]\([Yy]es\)\s*[=:]\s*(\d+\.?\d*)',
-        r'[Pp]robability[:\s]+(\d+\.?\d*)%',
-        r'[Pp]robability[:\s]+(\d+\.?\d*)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, final_answer)
-        if match:
-            value = float(match.group(1))
-            if value > 1:
-                value = value / 100
-            return max(0.0, min(1.0, value))
-    
+    pred         = record.get('predicted')
+
+    # 2. New format: P(Yes): 0.75
+    if final_answer:
+        m = re.search(r'P\s*\(\s*[Yy]es\s*\)\s*[:\s]+([\d.]+)', final_answer)
+        if m:
+            val = float(m.group(1))
+            if val > 1:
+                val /= 100
+            return max(0.0, min(1.0, val))
+
+    # 3. Legacy: Confidence label (P(predicted option))
+    if final_answer and pred is not None:
+        m = re.search(r'[Cc]onfidence[:\s]+([\d.]+)', final_answer)
+        if m:
+            conf = float(m.group(1))
+            if conf > 1:
+                conf /= 100
+            conf = max(0.0, min(1.0, conf))
+            return conf if pred == 'Yes' else (1.0 - conf)
+
     return None
 
 
 def compute_calibration_metrics(data: List[Dict], n_bins: int = 10) -> CalibrationMetrics:
-    """Compute probability calibration metrics."""
+    """Compute probability calibration metrics.
+
+    Uses agent_prob_yes directly when available (preferred — already converted
+    to P(Yes) by evals.py).  Falls back to deriving P(Yes) from the confidence
+    field + predicted direction.
+    """
     metrics = CalibrationMetrics()
-    
-    # Extract records with confidence scores
+
     records_with_conf = []
     for record in data:
         gt = record.get('ground_truth')
         pred = record.get('predicted')
-        
+
         if pred is None or gt is None:
             continue
-        
-        conf = extract_confidence(record)
-        if conf is None:
+
+        prob_yes = extract_prob_yes_from_record(record)
+        if prob_yes is None:
             continue
-        
-        # Convert to P(Yes)
-        if pred == 'Yes':
-            prob_yes = conf
-        else:
-            prob_yes = 1 - conf
-        
-        actual = 1 if gt == 'Yes' else 0
+
+        prob_yes = float(prob_yes)
+        actual  = 1 if gt == 'Yes' else 0
         correct = (pred == gt)
-        
+        # agent confidence in its own prediction (not necessarily P(Yes))
+        conf_in_pred = prob_yes if pred == 'Yes' else (1.0 - prob_yes)
+
         records_with_conf.append({
-            'prob_yes': prob_yes,
-            'actual': actual,
-            'correct': correct,
-            'confidence': conf if pred == 'Yes' else (1 - conf)
+            'prob_yes':   prob_yes,
+            'actual':     actual,
+            'correct':    correct,
+            'confidence': conf_in_pred,
         })
     
     metrics.n_samples_with_confidence = len(records_with_conf)
@@ -536,31 +598,41 @@ def compute_operational_metrics(data: List[Dict]) -> OperationalMetrics:
     errors = [d for d in data if d.get('error')]
     metrics.total_errors = len(errors)
     metrics.error_rate = safe_divide(len(errors), len(data))
-    
-    # Classify error types
-    error_types = defaultdict(int)
-    timeout_count = 0
-    token_overflow_count = 0
-    
+
+    # Classify error types — order matters (most specific first)
+    error_types: Dict[str, int] = defaultdict(int)
+    timeout_count       = 0
+    token_limit_count   = 0
+    context_overflow_count = 0
+
     for d in errors:
-        error_msg = str(d.get('error', '')).lower()
-        
-        if 'recursion' in error_msg or 'limit' in error_msg:
-            error_types['recursion_limit'] += 1
-            timeout_count += 1
-        elif 'token' in error_msg or '15361' in error_msg or 'context' in error_msg:
-            error_types['token_overflow'] += 1
-            token_overflow_count += 1
-        elif 'timeout' in error_msg:
+        raw = str(d.get('error', ''))
+        msg = raw.lower()
+
+        if raw == 'TOKEN_LIMIT' or raw == 'token_limit':
+            # finish_reason == "length": generation was cut off mid-stream
+            error_types['token_limit'] += 1
+            token_limit_count += 1
+        elif raw == 'TIMEOUT' or msg == 'timeout':
             error_types['timeout'] += 1
             timeout_count += 1
-        elif 'rate' in error_msg:
+        elif raw == 'Iteration limit reached' or 'iteration limit' in msg:
+            error_types['iteration_limit'] += 1
+        elif raw in ('CONTEXT_LIMIT', 'context_limit') or \
+                'input_tokens' in msg or 'context length' in msg or 'maximum input length' in msg:
+            # CONTEXT_LIMIT = guard triggered cleanly; 400 BadRequest = guard missed
+            error_types['context_overflow'] += 1
+            context_overflow_count += 1
+        elif 'recursion' in msg:
+            error_types['recursion_limit'] += 1
+        elif 'rate' in msg:
             error_types['rate_limit'] += 1
         else:
             error_types['other'] += 1
-    
-    metrics.timeout_rate = safe_divide(timeout_count, len(data))
-    metrics.token_overflow_rate = safe_divide(token_overflow_count, len(data))
+
+    metrics.timeout_rate        = safe_divide(timeout_count, len(data))
+    metrics.token_limit_rate    = safe_divide(token_limit_count, len(data))
+    metrics.context_overflow_rate = safe_divide(context_overflow_count, len(data))
     metrics.error_types = dict(error_types)
     
     return metrics
@@ -666,6 +738,211 @@ def analyze_error_patterns(data: List[Dict]) -> Dict[str, int]:
     return dict(patterns)
 
 
+def _pearson_r(xs: List[float], ys: List[float]) -> Optional[float]:
+    """Pearson correlation coefficient, or None if degenerate."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov  = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    std_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
+    std_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
+    if std_x == 0 or std_y == 0:
+        return None
+    return cov / (std_x * std_y)
+
+
+def compute_timeseries_metrics(data: List[Dict]) -> TimeSeriesMetrics:
+    """Compute metrics specific to time-series evaluation.
+
+    Detects time-series records by the presence of 'timepoint_index' field.
+    Groups records by question_id to evaluate within-question consistency
+    and majority-vote accuracy.
+    """
+    metrics = TimeSeriesMetrics()
+
+    ts_records = [r for r in data if r.get('timepoint_index') is not None]
+    if not ts_records:
+        return metrics
+
+    metrics.available = True
+    metrics.n_total_timepoints = len(ts_records)
+
+    # Group by question_id
+    by_question: Dict[str, List[Dict]] = defaultdict(list)
+    for r in ts_records:
+        by_question[str(r['question_id'])].append(r)
+
+    metrics.n_questions = len(by_question)
+    metrics.avg_timepoints_per_question = metrics.n_total_timepoints / metrics.n_questions
+
+    # Sort each question's timepoints by index
+    for qid in by_question:
+        by_question[qid].sort(key=lambda r: r.get('timepoint_index', 0))
+
+    # Collect first and last timepoint records
+    first_recs = [recs[0]  for recs in by_question.values() if recs]
+    last_recs  = [recs[-1] for recs in by_question.values() if recs]
+
+    def _acc(recs: List[Dict]) -> Optional[float]:
+        valid = [r for r in recs if r.get('predicted') is not None and r.get('correct') is not None]
+        if not valid:
+            return None
+        return sum(1 for r in valid if r['correct']) / len(valid)
+
+    metrics.accuracy_first_timepoint = _acc(first_recs)
+    metrics.accuracy_last_timepoint  = _acc(last_recs)
+
+    # Early / late halves by timepoint_index relative to total_timepoints
+    early, late = [], []
+    for r in ts_records:
+        idx   = r.get('timepoint_index', 1)
+        total = r.get('total_timepoints', 1)
+        mid   = total / 2.0
+        if idx <= mid:
+            early.append(r)
+        else:
+            late.append(r)
+
+    metrics.accuracy_early_half = _acc(early) if early else None
+    metrics.accuracy_late_half  = _acc(late)  if late  else None
+
+    # Consistency: all timepoints for a question predict the same option
+    consistent = 0
+    for recs in by_question.values():
+        preds = [r.get('predicted') for r in recs if r.get('predicted') is not None]
+        if preds and len(set(preds)) == 1:
+            consistent += 1
+
+    metrics.consistency_rate = safe_divide(consistent, metrics.n_questions)
+
+    # Majority-vote accuracy: most common prediction per question vs ground truth
+    mv_correct = 0
+    mv_total   = 0
+    for recs in by_question.values():
+        gt = recs[0].get('ground_truth')
+        if gt is None:
+            continue
+        preds = [r.get('predicted') for r in recs if r.get('predicted') is not None]
+        if not preds:
+            continue
+        # majority vote
+        vote: Dict[str, int] = defaultdict(int)
+        for p in preds:
+            vote[p] += 1
+        majority = max(vote, key=lambda k: vote[k])
+        mv_total += 1
+        if majority == gt:
+            mv_correct += 1
+
+    metrics.majority_vote_accuracy = safe_divide(mv_correct, mv_total)
+
+    return metrics
+
+
+def compute_market_comparison_metrics(data: List[Dict]) -> MarketComparisonMetrics:
+    """Compare agent P(Yes) estimates against prediction market probabilities.
+
+    Requires both 'agent_prob_yes' and 'human_prob_yes' fields.
+    Only records where both are non-null and ground_truth is known are used.
+    """
+    metrics = MarketComparisonMetrics()
+
+    valid = [
+        r for r in data
+        if extract_prob_yes_from_record(r) is not None
+        and r.get('human_prob_yes') is not None
+        and r.get('ground_truth') is not None
+    ]
+    if len(valid) < 5:
+        return metrics
+
+    metrics.available = True
+    metrics.n_samples = len(valid)
+
+    agent_probs  = [extract_prob_yes_from_record(r) for r in valid]
+    market_probs = [float(r['human_prob_yes'])      for r in valid]
+    actuals      = [1 if r['ground_truth'] == 'Yes' else 0 for r in valid]
+
+    n = len(valid)
+
+    # Brier scores: BS = mean (p_yes - actual)^2
+    agent_bs  = sum((a - y) ** 2 for a, y in zip(agent_probs,  actuals)) / n
+    market_bs = sum((m - y) ** 2 for m, y in zip(market_probs, actuals)) / n
+    metrics.agent_brier_score  = round(agent_bs,  4)
+    metrics.market_brier_score = round(market_bs, 4)
+
+    # Brier Skill Score: 1 - (agent_BS / market_BS)
+    # Positive = agent beats market; negative = agent worse than market
+    if market_bs > 0:
+        metrics.brier_skill_score = round(1.0 - agent_bs / market_bs, 4)
+
+    # Pearson correlation between agent and market probability tracks
+    metrics.prob_correlation = _pearson_r(agent_probs, market_probs)
+    if metrics.prob_correlation is not None:
+        metrics.prob_correlation = round(metrics.prob_correlation, 4)
+
+    # Mean absolute deviation
+    metrics.mean_absolute_deviation = round(
+        sum(abs(a - m) for a, m in zip(agent_probs, market_probs)) / n, 4
+    )
+
+    # Directional agreement: both above 0.5 or both below 0.5
+    agree = sum(
+        1 for a, m in zip(agent_probs, market_probs)
+        if (a > 0.5) == (m > 0.5)
+    )
+    metrics.directional_agreement_rate = round(safe_divide(agree, n), 4)
+
+    return metrics
+
+
+def compute_reflection_quality_metrics(data: List[Dict]) -> ReflectionQualityMetrics:
+    """Analyse how reflection and self-critique correlate with prediction quality."""
+    metrics = ReflectionQualityMetrics()
+
+    # Only records where we have a definitive correct/incorrect label
+    scored = [r for r in data if r.get('correct') is not None]
+    if not scored:
+        return metrics
+
+    # Check if reflection fields are present in the dataset at all
+    has_field = any('reflection' in r or 'self_critique' in r for r in data)
+    if not has_field:
+        return metrics
+
+    metrics.available = True
+    metrics.n_total = len(scored)
+
+    with_refl   = [r for r in scored if r.get('reflection')]
+    with_crit   = [r for r in scored if r.get('self_critique')]
+    without_refl = [r for r in scored if not r.get('reflection')]
+    without_crit = [r for r in scored if not r.get('self_critique')]
+
+    metrics.n_with_reflection   = len(with_refl)
+    metrics.n_with_self_critique = len(with_crit)
+    metrics.reflection_rate     = round(safe_divide(len(with_refl), metrics.n_total), 4)
+    metrics.self_critique_rate  = round(safe_divide(len(with_crit), metrics.n_total), 4)
+
+    def _accuracy(recs: List[Dict]) -> Optional[float]:
+        valid = [r for r in recs if r.get('predicted') is not None]
+        if not valid:
+            return None
+        return round(sum(1 for r in valid if r['correct']) / len(valid), 4)
+
+    if with_refl:
+        metrics.accuracy_with_reflection    = _accuracy(with_refl)
+    if without_refl:
+        metrics.accuracy_without_reflection = _accuracy(without_refl)
+    if with_crit:
+        metrics.accuracy_with_self_critique    = _accuracy(with_crit)
+    if without_crit:
+        metrics.accuracy_without_self_critique = _accuracy(without_crit)
+
+    return metrics
+
+
 # =============================================================================
 # MAIN EVALUATION FUNCTION
 # =============================================================================
@@ -687,12 +964,15 @@ def evaluate(data: List[Dict], input_file: str = "") -> EvaluationReport:
     report.total_questions = len(data)
     
     # Compute all metrics
-    report.classification = compute_classification_metrics(data)
-    report.calibration = compute_calibration_metrics(data)
-    report.operational = compute_operational_metrics(data)
-    report.by_topic = compute_topic_metrics(data)
+    report.classification    = compute_classification_metrics(data)
+    report.calibration       = compute_calibration_metrics(data)
+    report.operational       = compute_operational_metrics(data)
+    report.timeseries        = compute_timeseries_metrics(data)
+    report.market_comparison = compute_market_comparison_metrics(data)
+    report.reflection_quality = compute_reflection_quality_metrics(data)
+    report.by_topic          = compute_topic_metrics(data)
     report.common_error_patterns = analyze_error_patterns(data)
-    
+
     return report
 
 
@@ -797,12 +1077,81 @@ def format_text_report(report: EvaluationReport) -> str:
     lines.append(f"Avg Tool Calls:              {op.avg_tool_calls:.1f}")
     lines.append(f"Max Tool Calls:              {op.max_tool_calls}")
     lines.append(f"Zero Tool Call Rate:         {op.zero_tool_call_rate:.1%}")
-    lines.append(f"Error Rate:                  {op.error_rate:.1%}")
+    lines.append(f"Error Rate:                  {op.error_rate:.1%}  ({op.total_errors} total)")
     lines.append(f"Timeout Rate:                {op.timeout_rate:.1%}")
+    lines.append(f"Token-Limit Rate:            {op.token_limit_rate:.1%}")
+    lines.append(f"Context-Overflow Rate:       {op.context_overflow_rate:.1%}")
     if op.error_types:
         lines.append(f"Error breakdown:             {op.error_types}")
     lines.append("")
-    
+
+    # Time-series metrics
+    ts = report.timeseries
+    if ts.available:
+        lines.append("TIME-SERIES METRICS")
+        lines.append("-" * 50)
+        lines.append(f"Questions:                   {ts.n_questions}")
+        lines.append(f"Total timepoints:            {ts.n_total_timepoints}")
+        lines.append(f"Avg timepoints/question:     {ts.avg_timepoints_per_question:.1f}")
+        if ts.accuracy_first_timepoint is not None:
+            lines.append(f"Accuracy (first timepoint):  {ts.accuracy_first_timepoint:.1%}")
+        if ts.accuracy_last_timepoint is not None:
+            lines.append(f"Accuracy (last timepoint):   {ts.accuracy_last_timepoint:.1%}")
+        if ts.accuracy_early_half is not None:
+            lines.append(f"Accuracy (early half):       {ts.accuracy_early_half:.1%}")
+        if ts.accuracy_late_half is not None:
+            lines.append(f"Accuracy (late half):        {ts.accuracy_late_half:.1%}")
+        lines.append(f"Consistency rate:            {ts.consistency_rate:.1%}  "
+                     f"(all timepoints agree per question)")
+        lines.append(f"Majority-vote accuracy:      {ts.majority_vote_accuracy:.1%}  "
+                     f"(per-question majority vote vs ground truth)")
+        lines.append("")
+
+    # Market comparison
+    mc = report.market_comparison
+    if mc.available:
+        lines.append("MARKET COMPARISON")
+        lines.append("-" * 50)
+        lines.append(f"Samples with market probs:   {mc.n_samples}")
+        lines.append(f"Agent Brier Score:           {mc.agent_brier_score:.4f}  "
+                     f"(lower is better; random=0.25)")
+        lines.append(f"Market Brier Score:          {mc.market_brier_score:.4f}")
+        if mc.brier_skill_score is not None:
+            sign = "+" if mc.brier_skill_score >= 0 else ""
+            verdict = "agent beats market" if mc.brier_skill_score > 0 else "market beats agent"
+            lines.append(f"Brier Skill Score:           {sign}{mc.brier_skill_score:.4f}  ({verdict})")
+        if mc.prob_correlation is not None:
+            lines.append(f"Prob. Correlation (r):       {mc.prob_correlation:.4f}  "
+                         f"(agent_prob_yes vs human_prob_yes)")
+        if mc.mean_absolute_deviation is not None:
+            lines.append(f"Mean Abs. Deviation:         {mc.mean_absolute_deviation:.4f}  "
+                         f"(avg |agent_p_yes - market_p_yes|)")
+        if mc.directional_agreement_rate is not None:
+            lines.append(f"Directional Agreement:       {mc.directional_agreement_rate:.1%}  "
+                         f"(both same side of 50%)")
+        lines.append("")
+
+    # Reflection quality
+    rq = report.reflection_quality
+    if rq.available:
+        lines.append("REFLECTION & SELF-CRITIQUE QUALITY")
+        lines.append("-" * 50)
+        lines.append(f"Reflection rate:             {rq.reflection_rate:.1%}  "
+                     f"({rq.n_with_reflection}/{rq.n_total})")
+        lines.append(f"Self-critique rate:          {rq.self_critique_rate:.1%}  "
+                     f"({rq.n_with_self_critique}/{rq.n_total})")
+        if rq.accuracy_with_reflection is not None and rq.accuracy_without_reflection is not None:
+            delta = rq.accuracy_with_reflection - rq.accuracy_without_reflection
+            sign  = "+" if delta >= 0 else ""
+            lines.append(f"Acc. with reflection:        {rq.accuracy_with_reflection:.1%}  "
+                         f"({sign}{delta:.1%} vs without)")
+        if rq.accuracy_with_self_critique is not None and rq.accuracy_without_self_critique is not None:
+            delta = rq.accuracy_with_self_critique - rq.accuracy_without_self_critique
+            sign  = "+" if delta >= 0 else ""
+            lines.append(f"Acc. with self-critique:     {rq.accuracy_with_self_critique:.1%}  "
+                         f"({sign}{delta:.1%} vs without)")
+        lines.append("")
+
     # By topic
     lines.append("METRICS BY TOPIC")
     lines.append("-" * 50)
@@ -813,7 +1162,7 @@ def format_text_report(report: EvaluationReport) -> str:
             f"{tm.f1_macro:>8.3f} {tm.n_samples:>6}"
         )
     lines.append("")
-    
+
     # Error patterns
     if report.common_error_patterns:
         lines.append("ERROR PATTERN ANALYSIS")
@@ -821,9 +1170,9 @@ def format_text_report(report: EvaluationReport) -> str:
         for pattern, count in sorted(report.common_error_patterns.items(), key=lambda x: -x[1]):
             lines.append(f"{pattern:<35} {count:>5}")
         lines.append("")
-    
+
     lines.append("=" * 70)
-    
+
     return "\n".join(lines)
 
 
@@ -865,7 +1214,52 @@ def format_csv_report(report: EvaluationReport) -> str:
     lines.append(f"p95_latency_sec,{op.p95_latency_sec:.2f},operational")
     lines.append(f"avg_tool_calls,{op.avg_tool_calls:.2f},operational")
     lines.append(f"error_rate,{op.error_rate:.4f},operational")
-    
+    lines.append(f"token_limit_rate,{op.token_limit_rate:.4f},operational")
+    lines.append(f"context_overflow_rate,{op.context_overflow_rate:.4f},operational")
+
+    # Time-series metrics
+    ts = report.timeseries
+    if ts.available:
+        lines.append(f"ts_n_questions,{ts.n_questions},timeseries")
+        lines.append(f"ts_consistency_rate,{ts.consistency_rate:.4f},timeseries")
+        lines.append(f"ts_majority_vote_accuracy,{ts.majority_vote_accuracy:.4f},timeseries")
+        if ts.accuracy_first_timepoint is not None:
+            lines.append(f"ts_accuracy_first,{ts.accuracy_first_timepoint:.4f},timeseries")
+        if ts.accuracy_last_timepoint is not None:
+            lines.append(f"ts_accuracy_last,{ts.accuracy_last_timepoint:.4f},timeseries")
+        if ts.accuracy_early_half is not None:
+            lines.append(f"ts_accuracy_early_half,{ts.accuracy_early_half:.4f},timeseries")
+        if ts.accuracy_late_half is not None:
+            lines.append(f"ts_accuracy_late_half,{ts.accuracy_late_half:.4f},timeseries")
+
+    # Market comparison metrics
+    mc = report.market_comparison
+    if mc.available:
+        lines.append(f"agent_brier_score,{mc.agent_brier_score:.4f},market_comparison")
+        lines.append(f"market_brier_score,{mc.market_brier_score:.4f},market_comparison")
+        if mc.brier_skill_score is not None:
+            lines.append(f"brier_skill_score,{mc.brier_skill_score:.4f},market_comparison")
+        if mc.prob_correlation is not None:
+            lines.append(f"prob_correlation,{mc.prob_correlation:.4f},market_comparison")
+        if mc.mean_absolute_deviation is not None:
+            lines.append(f"mean_abs_deviation,{mc.mean_absolute_deviation:.4f},market_comparison")
+        if mc.directional_agreement_rate is not None:
+            lines.append(f"directional_agreement,{mc.directional_agreement_rate:.4f},market_comparison")
+
+    # Reflection quality
+    rq = report.reflection_quality
+    if rq.available:
+        lines.append(f"reflection_rate,{rq.reflection_rate:.4f},reflection")
+        lines.append(f"self_critique_rate,{rq.self_critique_rate:.4f},reflection")
+        if rq.accuracy_with_reflection is not None:
+            lines.append(f"accuracy_with_reflection,{rq.accuracy_with_reflection:.4f},reflection")
+        if rq.accuracy_without_reflection is not None:
+            lines.append(f"accuracy_without_reflection,{rq.accuracy_without_reflection:.4f},reflection")
+        if rq.accuracy_with_self_critique is not None:
+            lines.append(f"accuracy_with_self_critique,{rq.accuracy_with_self_critique:.4f},reflection")
+        if rq.accuracy_without_self_critique is not None:
+            lines.append(f"accuracy_without_self_critique,{rq.accuracy_without_self_critique:.4f},reflection")
+
     return "\n".join(lines)
 
 
@@ -886,6 +1280,264 @@ def report_to_dict(report: EvaluationReport) -> Dict[str, Any]:
             return obj
     
     return dataclass_to_dict(report)
+
+
+# =============================================================================
+# CROSS-SETUP STATISTICAL COMPARISON
+# =============================================================================
+
+def _load_predictions_by_key(filepath: str) -> Dict[str, Dict]:
+    """Load JSONL, index by 'question_id:timepoint_date' for paired matching."""
+    preds = {}
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            qid = str(rec.get("question_id", ""))
+            tdate = rec.get("timepoint_date", rec.get("cutoff_date", ""))
+            key = f"{qid}:{tdate}"
+            preds[key] = rec
+    return preds
+
+
+def _paired_brier_scores(records_a: List[Dict], records_b: List[Dict]
+                         ) -> Tuple[List[float], List[float]]:
+    """Extract matched Brier scores from two lists of paired records."""
+    brier_a, brier_b = [], []
+    for ra, rb in zip(records_a, records_b):
+        gt = 1.0 if ra["ground_truth"] == "Yes" else 0.0
+        pa = ra.get("agent_prob_yes")
+        pb = rb.get("agent_prob_yes")
+        if pa is not None and pb is not None:
+            brier_a.append((pa - gt) ** 2)
+            brier_b.append((pb - gt) ** 2)
+    return brier_a, brier_b
+
+
+def bootstrap_ci(
+    scores_a: List[float],
+    scores_b: List[float],
+    n_bootstrap: int = 10000,
+    ci: float = 0.95,
+) -> Dict[str, float]:
+    """
+    Paired bootstrap confidence interval on mean(scores_a) - mean(scores_b).
+    Returns: mean_diff, ci_lower, ci_upper, p_value (two-sided).
+    """
+    import random
+    n = len(scores_a)
+    if n == 0:
+        return {"mean_diff": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "p_value": 1.0, "n": 0}
+
+    diffs = [a - b for a, b in zip(scores_a, scores_b)]
+    observed_diff = sum(diffs) / n
+
+    boot_diffs = []
+    for _ in range(n_bootstrap):
+        sample = random.choices(diffs, k=n)
+        boot_diffs.append(sum(sample) / n)
+    boot_diffs.sort()
+
+    alpha = 1 - ci
+    lo_idx = int(n_bootstrap * alpha / 2)
+    hi_idx = int(n_bootstrap * (1 - alpha / 2))
+    ci_lower = boot_diffs[lo_idx]
+    ci_upper = boot_diffs[min(hi_idx, n_bootstrap - 1)]
+
+    # Two-sided p-value: proportion of bootstrap samples on the opposite side of zero
+    if observed_diff >= 0:
+        p_value = sum(1 for d in boot_diffs if d <= 0) / n_bootstrap
+    else:
+        p_value = sum(1 for d in boot_diffs if d >= 0) / n_bootstrap
+    p_value = min(p_value * 2, 1.0)  # two-sided
+
+    return {
+        "mean_diff": round(observed_diff, 6),
+        "ci_lower": round(ci_lower, 6),
+        "ci_upper": round(ci_upper, 6),
+        "p_value": round(p_value, 4),
+        "n": n,
+    }
+
+
+def mcnemar_test(correct_a: List[bool], correct_b: List[bool]) -> Dict[str, float]:
+    """
+    McNemar's test for paired binary classification.
+    Tests whether two setups disagree on significantly different cases.
+    """
+    # Count discordant pairs
+    b_count = 0  # A correct, B wrong
+    c_count = 0  # A wrong, B correct
+    for a, b in zip(correct_a, correct_b):
+        if a and not b:
+            b_count += 1
+        elif not a and b:
+            c_count += 1
+
+    n_discordant = b_count + c_count
+    if n_discordant == 0:
+        return {"chi2": 0.0, "p_value": 1.0, "n_discordant": 0,
+                "a_only_correct": b_count, "b_only_correct": c_count}
+
+    # McNemar chi-squared with continuity correction
+    chi2 = (abs(b_count - c_count) - 1) ** 2 / (b_count + c_count)
+
+    # Approximate p-value from chi2 distribution (1 df)
+    # Using survival function approximation
+    p_value = math.exp(-chi2 / 2)  # conservative approximation for chi2(1)
+
+    return {
+        "chi2": round(chi2, 4),
+        "p_value": round(p_value, 4),
+        "n_discordant": n_discordant,
+        "a_only_correct": b_count,
+        "b_only_correct": c_count,
+    }
+
+
+def wilcoxon_signed_rank(diffs: List[float]) -> Dict[str, float]:
+    """
+    Wilcoxon signed-rank test on paired differences.
+    Tests whether the median difference is significantly different from zero.
+    Uses normal approximation for n > 20.
+    """
+    # Remove zeros
+    nonzero = [(abs(d), 1 if d > 0 else -1) for d in diffs if d != 0]
+    n = len(nonzero)
+    if n == 0:
+        return {"W": 0.0, "z": 0.0, "p_value": 1.0, "n": 0}
+
+    # Rank by absolute value
+    nonzero.sort(key=lambda x: x[0])
+    ranks = list(range(1, n + 1))
+
+    # Handle ties (average rank)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and nonzero[j][0] == nonzero[i][0]:
+            j += 1
+        if j > i + 1:
+            avg_rank = sum(ranks[i:j]) / (j - i)
+            for k in range(i, j):
+                ranks[k] = avg_rank
+        i = j
+
+    # W+ = sum of ranks for positive differences
+    w_plus = sum(ranks[i] for i in range(n) if nonzero[i][1] > 0)
+    w_minus = sum(ranks[i] for i in range(n) if nonzero[i][1] < 0)
+    W = min(w_plus, w_minus)
+
+    # Normal approximation (n > 20)
+    if n > 20:
+        mean_w = n * (n + 1) / 4
+        std_w = math.sqrt(n * (n + 1) * (2 * n + 1) / 24)
+        z = (W - mean_w) / std_w if std_w > 0 else 0.0
+        # Two-sided p-value from normal approximation
+        p_value = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
+    else:
+        # For small n, report W statistic without p-value approximation
+        z = 0.0
+        p_value = None  # would need exact tables
+
+    return {
+        "W": round(W, 4),
+        "z": round(z, 4),
+        "p_value": round(p_value, 4) if p_value is not None else None,
+        "n": n,
+        "W_plus": round(w_plus, 4),
+        "W_minus": round(w_minus, 4),
+    }
+
+
+def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
+    """
+    Statistical comparison between two result files.
+    Returns formatted text report with bootstrap CI, McNemar, and Wilcoxon tests.
+    """
+    preds_a = _load_predictions_by_key(file_a)
+    preds_b = _load_predictions_by_key(file_b)
+
+    # Find matched keys
+    common_keys = sorted(set(preds_a.keys()) & set(preds_b.keys()))
+    if not common_keys:
+        return "ERROR: No matched question-timepoint pairs found between the two files."
+
+    matched_a = [preds_a[k] for k in common_keys]
+    matched_b = [preds_b[k] for k in common_keys]
+
+    # Setup names from records
+    name_a = file_a.split("/")[-1]
+    name_b = file_b.split("/")[-1]
+    setup_a = matched_a[0].get("setup", "?")
+    setup_b = matched_b[0].get("setup", "?")
+
+    lines = []
+    lines.append("=" * 65)
+    lines.append(f"STATISTICAL COMPARISON")
+    lines.append(f"  A: {name_a}  (setup {setup_a})")
+    lines.append(f"  B: {name_b}  (setup {setup_b})")
+    lines.append(f"  Matched pairs: {len(common_keys)}")
+    lines.append("=" * 65)
+
+    # 1. Paired Bootstrap on Brier Score
+    brier_a, brier_b = _paired_brier_scores(matched_a, matched_b)
+    if brier_a:
+        boot = bootstrap_ci(brier_a, brier_b, n_bootstrap=n_bootstrap)
+        lines.append(f"\n--- Brier Score (Paired Bootstrap, n={boot['n']}) ---")
+        lines.append(f"  Mean Brier A:  {sum(brier_a)/len(brier_a):.4f}")
+        lines.append(f"  Mean Brier B:  {sum(brier_b)/len(brier_b):.4f}")
+        lines.append(f"  Δ (A - B):     {boot['mean_diff']:+.4f}  "
+                      f"95% CI [{boot['ci_lower']:+.4f}, {boot['ci_upper']:+.4f}]")
+        lines.append(f"  p-value:       {boot['p_value']:.4f}"
+                      + ("  *" if boot['p_value'] < 0.05 else "")
+                      + ("  **" if boot['p_value'] < 0.01 else ""))
+        if boot['mean_diff'] > 0:
+            lines.append(f"  → B is better (lower Brier)")
+        elif boot['mean_diff'] < 0:
+            lines.append(f"  → A is better (lower Brier)")
+    else:
+        lines.append("\n--- Brier Score: insufficient probability data ---")
+
+    # 2. McNemar's Test on Accuracy
+    correct_a = [r.get("correct", False) is True for r in matched_a]
+    correct_b = [r.get("correct", False) is True for r in matched_b]
+    acc_a = sum(correct_a) / len(correct_a) if correct_a else 0
+    acc_b = sum(correct_b) / len(correct_b) if correct_b else 0
+    mcn = mcnemar_test(correct_a, correct_b)
+    lines.append(f"\n--- Accuracy (McNemar's Test, n={len(common_keys)}) ---")
+    lines.append(f"  Accuracy A:    {acc_a:.4f}")
+    lines.append(f"  Accuracy B:    {acc_b:.4f}")
+    lines.append(f"  Δ (A - B):     {acc_a - acc_b:+.4f}")
+    lines.append(f"  A correct, B wrong: {mcn['a_only_correct']}")
+    lines.append(f"  B correct, A wrong: {mcn['b_only_correct']}")
+    lines.append(f"  χ²:            {mcn['chi2']:.4f}")
+    lines.append(f"  p-value:       {mcn['p_value']:.4f}"
+                  + ("  *" if mcn['p_value'] < 0.05 else "")
+                  + ("  **" if mcn['p_value'] < 0.01 else ""))
+
+    # 3. Wilcoxon Signed-Rank on per-question Brier differences
+    if brier_a:
+        brier_diffs = [a - b for a, b in zip(brier_a, brier_b)]
+        wilc = wilcoxon_signed_rank(brier_diffs)
+        lines.append(f"\n--- Brier Difference (Wilcoxon Signed-Rank, n={wilc['n']}) ---")
+        lines.append(f"  W+:            {wilc['W_plus']:.1f}  (A worse)")
+        lines.append(f"  W-:            {wilc['W_minus']:.1f}  (B worse)")
+        lines.append(f"  W:             {wilc['W']:.1f}")
+        if wilc['p_value'] is not None:
+            lines.append(f"  z:             {wilc['z']:.4f}")
+            lines.append(f"  p-value:       {wilc['p_value']:.4f}"
+                          + ("  *" if wilc['p_value'] < 0.05 else "")
+                          + ("  **" if wilc['p_value'] < 0.01 else ""))
+
+    lines.append("\n" + "=" * 65)
+    lines.append("Significance: * p<0.05  ** p<0.01")
+    lines.append("Positive Δ Brier = A has higher (worse) Brier score")
+    lines.append("=" * 65)
+
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -916,6 +1568,10 @@ Examples:
         """
     )
     parser.add_argument('input_file', help='JSONL file with predictions')
+    parser.add_argument('--compare', metavar='FILE_B',
+                        help='Second JSONL file for statistical comparison (paired tests)')
+    parser.add_argument('--bootstrap-n', type=int, default=10000,
+                        help='Number of bootstrap samples for CI (default 10000)')
     parser.add_argument('--output', '-o', help='Output file path')
     parser.add_argument('--output-dir', help='Output directory (for --format all)')
     parser.add_argument(
@@ -931,7 +1587,19 @@ Examples:
     )
     
     args = parser.parse_args()
-    
+
+    # --- Compare mode ---
+    if args.compare:
+        report = compare_setups(args.input_file, args.compare,
+                                n_bootstrap=args.bootstrap_n)
+        if not args.quiet:
+            print(report)
+        if args.output:
+            Path(args.output).write_text(report)
+            if not args.quiet:
+                print(f"\nComparison saved to {args.output}")
+        sys.exit(0)
+
     # Load data
     try:
         data = load_data(args.input_file)

@@ -17,7 +17,7 @@ def _get_client() -> Text2SQLIPCClient:
     return Text2SQLIPCClient.tcp(_D_AGENT_HOST, _D_AGENT_PORT, authkey=_D_AGENT_AUTHKEY)
 
 
-def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit: str = "", start_time: str = "") -> str:
+def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit: str = "", start_time: str = "", engine: str = "hybrid", month: str = "", authors: str = "") -> str:
     client = None
     try:
         lines = [f"Question: {query}", f"Cutoff_time: {cutoff_time}"]
@@ -27,8 +27,14 @@ def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit:
             lines.append(f"Subreddits: {subreddit}")
         if start_time:
             lines.append(f"Start_time: {start_time}")
+        if month:
+            lines.append(f"Month: {month}")
+        if authors:
+            lines.append(f"Authors: {authors}")
+        if engine not in ("hybrid", "vector"):
+            engine = "hybrid"
         client = _get_client()
-        return client.query("\n".join(lines), engine="hybrid")
+        return client.query("\n".join(lines), engine=engine)
     except Exception as e:
         return f"TOOL ERROR: The search failed. Reason: {str(e)}."
     finally:
@@ -98,7 +104,7 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {
         "name": "search_database",
         "description": (
-            "Search the Reddit database for posts and comments using hybrid semantic + full-text search. "
+            "Search the Reddit database for posts and comments. Supports hybrid (semantic + keyword) and pure vector (semantic only) search modes. "
             "PRIMARY evidence-gathering tool. Returns ranked results with IDs, snippets, and metadata. "
             "Available subreddits: CryptoCurrency, Economics, personalfinance, Entrepreneur, worldnews, "
             "politics, science, technology, space, Health, ChatGPT, hardware, music, movies, sports, "
@@ -112,6 +118,9 @@ TOOL_SCHEMAS = [
                 "doc_type":    {"type": "string", "description": "'submission' or 'comment', or '' for both", "default": ""},
                 "subreddit":   {"type": "string", "description": "Single subreddit name, or '' for all", "default": ""},
                 "start_time":  {"type": "string", "description": "Lower date bound YYYY-MM-DD, or ''", "default": ""},
+                "engine":      {"type": "string", "enum": ["hybrid", "vector"], "description": "Search engine: 'hybrid' (semantic + keyword, default) or 'vector' (pure semantic)", "default": "hybrid"},
+                "month":       {"type": "string", "description": "Filter to specific month, format YYYY-MM, or '' for no filter", "default": ""},
+                "authors":     {"type": "string", "description": "Comma-separated author names to filter by, or '' for no filter", "default": ""},
             },
             "required": ["query", "cutoff_time"],
         },
