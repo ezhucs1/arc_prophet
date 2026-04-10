@@ -79,8 +79,8 @@ Run **both** modes as a controlled ablation:
 The comparison itself is a paper contribution.
 
 ### Decision needed
-- [ ] Add sequential mode? (Yes / No / Later)
-- [ ] If yes: what to include in summary? (conclusion only / conclusion + evidence / conclusion + evidence + self-critique)
+- [x] Add sequential mode? (Yes / No / Later)
+- [x] If yes: what to include in summary? (conclusion only / conclusion + evidence / conclusion + evidence + self-critique)
 
 ---
 
@@ -129,8 +129,8 @@ Self-critique: <strongest counter-argument; note if confusing absence-of-evidenc
 This is a prompt instruction, not an injected message. The LLM may still not comply — but with the instruction in the base prompt, compliance should be higher.
 
 ### Decision needed
-- [ ] Which option? (A / B / C)
-- [ ] Should zero-shot also have final reflection? (Yes = richer data / No = cleaner baseline)
+- [x] Which option? (A / B / C)
+- [x] Should zero-shot also have final reflection? (Yes = richer data / No = cleaner baseline)
 
 ---
 
@@ -160,7 +160,7 @@ More parameters = more tokens in tool schemas (~150 extra tokens). Negligible im
 **None.** This only adds options. Old results were produced with hybrid-only and fewer filters. New results will have more flexibility. The two are still comparable because the LLM *can* choose to use only hybrid with no extra filters — it's additive.
 
 ### Decision needed
-- [ ] Add all three? (Yes / No / Partial — specify which)
+- [x] Add all three? (Yes / No / Partial — specify which)
 
 ---
 
@@ -195,8 +195,8 @@ One extra zero-shot LLM call per timepoint (~8.7s based on Run 3 latency). For 9
 If you run ZS and ReAct on the **same questions and timepoints**, you can compute information gain by matching records. This avoids the extra LLM call but requires careful record matching and assumes the ZS run represents the agent's true prior (it does, since ZS = no tools).
 
 ### Decision needed
-- [ ] Add prior measurement? (Yes — inline / Yes — use ZS run as proxy / No / Later)
-- [ ] Add `--no_prior` flag to skip when not needed? (Yes / No)
+- [x] Add prior measurement? (Yes — inline / Yes — use ZS run as proxy / No / Later)
+- [x] Add `--no_prior` flag to skip when not needed? (Yes / No)
 
 ---
 

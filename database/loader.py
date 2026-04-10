@@ -42,21 +42,37 @@ def _extract_market_probs(history_prices: list, cutoff_date: str) -> tuple[Optio
     """
     Return (market_prob_yes, market_prob_no) at the closest date at or before cutoff_date.
     Each is the market-implied probability (0.0–1.0) for that outcome.
+
+    Fallback: if no prices exist at or before cutoff_date (e.g. price history was
+    scraped after the market's close date), use the last available price instead.
+    This ensures question-by-question mode always has a market baseline for Brier Score.
     """
     best: dict[str, tuple[str, float]] = {}  # outcome_label → (best_date, price)
+    last: dict[str, tuple[str, float]] = {}  # fallback: latest price regardless of cutoff
     for entry in history_prices:
         label = entry.get("outcome_label")
         if label not in ("Yes", "No"):
             continue
         d = entry.get("date_utc", "")[:10]
-        if not d or d > cutoff_date:
+        if not d:
+            continue
+        try:
+            price = round(float(entry["price"]), 4)
+        except (ValueError, KeyError):
+            continue
+        # Track last available price (fallback)
+        prev_last = last.get(label, ("", None))[0]
+        if d >= prev_last:
+            last[label] = (d, price)
+        # Track best price at or before cutoff
+        if d > cutoff_date:
             continue
         prev_date = best.get(label, ("", None))[0]
         if d >= prev_date:
-            try:
-                best[label] = (d, round(float(entry["price"]), 4))
-            except (ValueError, KeyError):
-                pass
+            best[label] = (d, price)
+    # Use cutoff-filtered prices if available, otherwise fall back to last available
+    if not best:
+        best = last
     yes = best.get("Yes", (None, None))[1]
     no  = best.get("No",  (None, None))[1]
     return yes, no
@@ -66,7 +82,7 @@ def _extract_timeseries(history_prices: list, close_date: str) -> list[dict]:
     """
     Build a sorted list of daily timepoints from history_prices.
 
-    Each entry: {date, human_prob_yes, human_prob_no}
+    Each entry: {date, market_prob_yes, market_prob_no}
 
     The close_date is excluded — passing the resolution date as the agent's
     cutoff would leak the outcome (news/posts from that day reveal the result).
@@ -97,8 +113,8 @@ def _extract_timeseries(history_prices: list, close_date: str) -> list[dict]:
             continue
         timepoints.append({
             "date":           d,
-            "human_prob_yes": yes,
-            "human_prob_no":  no,
+            "market_prob_yes": yes,
+            "market_prob_no":  no,
         })
     return timepoints
 
@@ -112,7 +128,7 @@ def load_polymarket_timeseries(
     Load Polymarket questions with full time-series price history.
 
     Returns a list of question dicts, each with a ``timepoints`` key:
-      [{"date": "YYYY-MM-DD", "human_prob_yes": float, "human_prob_no": float}, ...]
+      [{"date": "YYYY-MM-DD", "market_prob_yes": float, "market_prob_no": float}, ...]
 
     Timepoints are evenly sampled when max_timepoints is set (default: all).
     The market close date is excluded from timepoints to prevent data leakage.

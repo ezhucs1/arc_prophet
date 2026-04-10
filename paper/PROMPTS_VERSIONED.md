@@ -1,5 +1,5 @@
 # Prompt Version History
-**Last updated:** 2026-04-04
+**Last updated:** 2026-04-08
 
 This file snapshots the exact prompt text for every version used in experiments.
 Tag every result file with its prompt version. Never report results without this mapping.
@@ -8,12 +8,14 @@ Tag every result file with its prompt version. Never report results without this
 
 ## Version Map
 
-| Version | Git commit | Date introduced | Result files that used it |
-|---------|-----------|-----------------|--------------------------|
-| v1 | pre-`5caad98` | Before 2026-04-03 | None (internal testing only) |
-| **v2** | `5caad98` | 2026-04-03 | `results_ts_XXXXXX.jsonl`, `results_r_ts_20260402_234954.jsonl`, `results_zs_ts_20260402_235856.jsonl` |
-| **v3** | post-`5caad98` | 2026-04-04 | None (superseded by v4 before any runs) |
-| **v4** | current HEAD | 2026-04-07 | All future runs (7-setup framework) |
+| Version | Git commit | Date introduced | Result files that used it | Output format |
+|---------|-----------|-----------------|--------------------------|---------------|
+| v1 | pre-`5caad98` | Before 2026-04-03 | None (internal testing only) | `Confidence:` |
+| **v2** | `5caad98` | 2026-04-03 | `results_ts_XXXXXX.jsonl`, `results_r_ts_20260402_234954.jsonl`, `results_zs_ts_20260402_235856.jsonl` | `Confidence:` |
+| **v3** | post-`5caad98` | 2026-04-04 | None (superseded by v4 before any runs) | `P(Yes):` |
+| **v4** | current HEAD | 2026-04-07 | All future runs (7-setup framework) | XML `<prediction>` |
+
+**Important:** v2, v3, and v4 results are NOT directly comparable due to output format differences. See §Backward Compatibility below.
 
 ---
 
@@ -197,7 +199,7 @@ Confidence: <a decimal between 0.0 and 1.0 reflecting how certain you are, e.g. 
 
 ---
 
-## Prompt v3 (current HEAD — used for all future runs)
+## Prompt v3 (superseded — no runs produced)
 
 ### What changed from v2 → v3
 - `Confidence: <certainty in answer>` → `P(Yes): <probability Yes is correct>`
@@ -208,14 +210,53 @@ Confidence: <a decimal between 0.0 and 1.0 reflecting how certain you are, e.g. 
 ### Motivation
 21% of v2 ReAct+Reflection records and 34% of v2 ZS records had `predicted ≠ argmax(agent_prob_yes, agent_prob_no)`. The model interpreted "Confidence: 0.3 with Selected Option: No" as "30% sure about No" (making P(Yes)=0.7), yet chose No. This inconsistency is eliminated in v3 by defining the probability field as P(Yes) and deriving the choice from it.
 
-### Backward compatibility
-Old result files (v2) are correctly evaluated by `eval_forecasting.py`:
-1. Checks `agent_prob_yes` field first (pre-computed, reliable)
-2. Falls back to `P(Yes):` text pattern
-3. Falls back to `Confidence + predicted direction` (legacy)
+**Note:** v3 was superseded by v4 (XML format) before any experiment runs were produced with it.
 
-### Full v3 prompt text
-See current `agent/prompts.py` in the repository.
+---
+
+## Prompt v4 (current HEAD — used for all future runs, 7-setup framework)
+
+### What changed from v3 → v4
+- **Output format:** `P(Yes): 0.75` plain text → structured XML `<prediction><yes>0.75</yes><no>0.25</no><reasoning>...</reasoning></prediction>`
+- **7 distinct setup prompts** in `agent/prompts.py` (`SETUP_PROMPTS` dict, keys 1-7)
+- **Carry-forward addons:** `format_carry_context()` inserts prior-timepoint conclusions/critiques into user prompt
+- **Conclusion generation prompt:** `CONCLUSION_GENERATION_PROMPT` — separate LLM call after each timepoint to generate structured `<conclusion>` XML
+- **Self-critique generation prompt:** `SELF_CRITIQUE_GENERATION_PROMPT` — separate LLM call to generate `<self_critique>` XML (no outcome feedback)
+
+### Motivation
+XML output format enables unambiguous extraction (regex on XML tags) vs plain text parsing. The 7-setup design requires per-setup prompts that share a common output format. XML also eliminates the v2 inconsistency problem by construction — `<yes>` and `<no>` are explicitly separate fields.
+
+### Extraction priority chain (backward-compatible)
+`eval_forecasting.py` and `evals.py` parse predictions using this priority:
+1. `extract_prediction_xml()` — XML `<prediction>` block (v4)
+2. `extract_prob_yes()` — `P(Yes): 0.75` text pattern (v3)
+3. `extract_confidence_legacy()` — `Confidence: 0.75` + `Selected Option:` (v2)
+
+Old result files (v2) are correctly evaluated without any changes.
+
+### Full v4 prompt text
+See `agent/prompts.py` in the repository — `SETUP_PROMPTS[1]` through `SETUP_PROMPTS[7]`.
+
+---
+
+## Graceful Timeout Prompt (injected only when time budget is exceeded)
+
+When a ReAct question exceeds its time budget, one final LLM call is made with `tools=None` using this prompt:
+
+```
+TIME BUDGET EXCEEDED. Based on ALL evidence you have gathered so far,
+produce your final prediction NOW. Do not call any more tools.
+
+<prediction>
+  <yes>{probability}</yes>
+  <no>{probability}</no>
+  <reasoning>{synthesize all evidence gathered}</reasoning>
+</prediction>
+```
+
+This is NOT part of the normal ReAct loop — it fires only after budget exhaustion. Results are tagged `GRACEFUL_TIMEOUT` to distinguish from normal completions. The LLM has full access to all prior messages (tool calls, results, reasoning) when producing this final answer.
+
+**Design rationale:** This does not violate the LLM autonomy principle because the agent's active reasoning phase is already complete (budget expired). It is a data recovery mechanism, not a mid-loop steering intervention. See CHECKPOINT.md Error 9 for full context.
 
 ---
 

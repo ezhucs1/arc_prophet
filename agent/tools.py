@@ -17,7 +17,7 @@ def _get_client() -> Text2SQLIPCClient:
     return Text2SQLIPCClient.tcp(_D_AGENT_HOST, _D_AGENT_PORT, authkey=_D_AGENT_AUTHKEY)
 
 
-def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit: str = "", start_time: str = "", engine: str = "hybrid", month: str = "", authors: str = "") -> str:
+def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit: str = "", start_time: str = "", engine: str = "vector", month: str = "", authors: str = "") -> str:
     client = None
     try:
         lines = [f"Question: {query}", f"Cutoff_time: {cutoff_time}"]
@@ -31,8 +31,7 @@ def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit:
             lines.append(f"Month: {month}")
         if authors:
             lines.append(f"Authors: {authors}")
-        if engine not in ("hybrid", "vector"):
-            engine = "hybrid"
+        engine = "vector"  # always vector; hybrid is deprecated (260s vs 0.1s)
         client = _get_client()
         return client.query("\n".join(lines), engine=engine)
     except Exception as e:
@@ -42,9 +41,15 @@ def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit:
             client.close()
 
 
+def _strip_compound_id(raw_id: str) -> str:
+    """Strip compound prefix: '2025-02:comment:mc806oy' → 'mc806oy'."""
+    return raw_id.rsplit(":", 1)[-1] if ":" in raw_id else raw_id
+
+
 def get_post_core_info(post_id: str, cutoff_time: str) -> str:
     client = None
     try:
+        post_id = _strip_compound_id(post_id)
         client = _get_client()
         return client.query(f'getpostcoreinfo("{post_id}", "{cutoff_time}")', engine="sql")
     except Exception as e:
@@ -57,6 +62,7 @@ def get_post_core_info(post_id: str, cutoff_time: str) -> str:
 def get_comment_core_info(comment_id: str, cutoff_time: str) -> str:
     client = None
     try:
+        comment_id = _strip_compound_id(comment_id)
         client = _get_client()
         return client.query(f'getcommentcoreinfo("{comment_id}", "{cutoff_time}")', engine="sql")
     except Exception as e:
@@ -69,6 +75,7 @@ def get_comment_core_info(comment_id: str, cutoff_time: str) -> str:
 def get_post_comments_list(comment_id: str, cutoff_time: str, up: int = 0, down: int = 0, max_comments: int = 100) -> str:
     client = None
     try:
+        comment_id = _strip_compound_id(comment_id)
         client = _get_client()
         result = client.query(
             f'getpostcommentslist("{comment_id}", "{cutoff_time}", {up}, {down}, {max_comments})',
@@ -118,7 +125,7 @@ TOOL_SCHEMAS = [
                 "doc_type":    {"type": "string", "description": "'submission' or 'comment', or '' for both", "default": ""},
                 "subreddit":   {"type": "string", "description": "Single subreddit name, or '' for all", "default": ""},
                 "start_time":  {"type": "string", "description": "Lower date bound YYYY-MM-DD, or ''", "default": ""},
-                "engine":      {"type": "string", "enum": ["hybrid", "vector"], "description": "Search engine: 'hybrid' (semantic + keyword, default) or 'vector' (pure semantic)", "default": "hybrid"},
+                "engine":      {"type": "string", "enum": ["vector"], "description": "Search engine: vector (semantic search). Always use vector.", "default": "vector"},
                 "month":       {"type": "string", "description": "Filter to specific month, format YYYY-MM, or '' for no filter", "default": ""},
                 "authors":     {"type": "string", "description": "Comma-separated author names to filter by, or '' for no filter", "default": ""},
             },

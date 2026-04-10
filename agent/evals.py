@@ -12,7 +12,6 @@ import sys
 import argparse
 import json
 import re
-import signal
 import time
 import threading
 from collections import defaultdict
@@ -41,7 +40,7 @@ DATASET_PATH = Path(__file__).parent.parent / "database" / "polymarket_binary_ye
 RESULTS_DIR  = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-DEFAULT_TIMEOUT_SEC = 300
+DEFAULT_TIMEOUT_SEC = 120
 
 
 # ── Answer / confidence extraction ───────────────────────────────────────────
@@ -269,12 +268,6 @@ def extract_agent_prediction(text: str, options: list[str]) -> dict:
 
 # ── Timeout helper ────────────────────────────────────────────────────────────
 
-class _Timeout(Exception):
-    pass
-
-def _alarm_handler(signum, frame):
-    raise _Timeout()
-
 
 # ── Per-question runners ──────────────────────────────────────────────────────
 
@@ -284,76 +277,72 @@ def run_single(question: str, options: list[str], cutoff_time: str,
                thinking: bool = True,
                setup: int | None = None,
                carry_context: str = "") -> dict:
-    # SIGALRM only works in the main thread; use thread-based timeout otherwise
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(timeout_sec)
-        try:
-            return run_react(question, options, cutoff_time, reflection=reflection,
-                             thinking=thinking, setup=setup, carry_context=carry_context)
-        except _Timeout:
-            return {"final_answer": "", "tool_call_count": 0,
-                    "latency_sec": float(timeout_sec), "error": "TIMEOUT"}
-        except Exception as e:
-            return {"final_answer": "", "tool_call_count": 0, "latency_sec": 0.0, "error": str(e)}
-        finally:
-            signal.alarm(0)
-    else:
-        # Thread-safe timeout using concurrent.futures
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                run_react, question, options, cutoff_time,
-                reflection=reflection, thinking=thinking,
-                setup=setup, carry_context=carry_context,
-            )
-            try:
-                return future.result(timeout=timeout_sec)
-            except Exception as e:
-                error_type = "TIMEOUT" if "TimeoutError" in type(e).__name__ else str(e)
-                return {"final_answer": "", "tool_call_count": 0,
-                        "latency_sec": float(timeout_sec), "error": error_type}
+    """
+    Run one ReAct question with timeout.
+
+    Uses threading.Timer + cancel_event for reliable timeout in ALL threads.
+    SIGALRM is unreliable (swallowed by C extensions during HTTP I/O).
+    No nested ThreadPoolExecutor (causes deadlock).
+    """
+    cancel = threading.Event()
+    timer = threading.Timer(timeout_sec, cancel.set)
+    timer.daemon = True
+    timer.start()
+    start = time.time()
+    try:
+        result = run_react(question, options, cutoff_time,
+                           reflection=reflection, thinking=thinking,
+                           setup=setup, carry_context=carry_context,
+                           cancel_event=cancel, timeout_sec=timeout_sec)
+        return result
+    except Exception as e:
+        return {"final_answer": "", "tool_call_count": 0, "iteration_count": 0,
+                "latency_sec": round(time.time() - start, 2), "error": str(e)}
+    finally:
+        timer.cancel()
+
+
+def _run_zero_shot_impl(question: str, options: list[str], cutoff_time: str,
+                        timeout_sec: int = 90) -> dict:
+    """Inner zero-shot logic with per-call HTTP timeout."""
+    from shared.llm import get_client, get_model
+    start = time.time()
+    client = get_client()
+    model  = get_model()
+    options_str = ", ".join(options)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": ZERO_SHOT_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Question: {question}\n"
+                f"Options: {options_str}\n"
+                f"Cutoff Date: {cutoff_time}\n\n"
+                f"You MUST select exactly one of the provided options as your final answer."
+            )},
+        ],
+        temperature=0.1,
+        max_tokens=8192,
+        timeout=float(timeout_sec),
+    )
+    choice = response.choices[0]
+    error  = "TOKEN_LIMIT" if choice.finish_reason == "length" else None
+    return {
+        "final_answer":    choice.message.content or "",
+        "tool_call_count": 0,
+        "iteration_count": 1,
+        "latency_sec":     round(time.time() - start, 2),
+        "error":           error,
+    }
 
 
 def run_zero_shot(question: str, options: list[str], cutoff_time: str,
                   timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> dict:
-    """Single LLM call with no tools — pure zero-shot baseline."""
-    from shared.llm import get_client, get_model
-    signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(timeout_sec)
-    start = time.time()
+    """Single LLM call with no tools — pure zero-shot baseline. Thread-safe."""
     try:
-        client = get_client()
-        model  = get_model()
-        options_str = ", ".join(options)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": ZERO_SHOT_SYSTEM_PROMPT},
-                {"role": "user", "content": (
-                    f"Question: {question}\n"
-                    f"Options: {options_str}\n"
-                    f"Cutoff Date: {cutoff_time}\n\n"
-                    f"You MUST select exactly one of the provided options as your final answer."
-                )},
-            ],
-            temperature=0.1,
-            max_tokens=4096,
-        )
-        choice = response.choices[0]
-        error  = "TOKEN_LIMIT" if choice.finish_reason == "length" else None
-        return {
-            "final_answer":    choice.message.content or "",
-            "tool_call_count": 0,
-            "latency_sec":     round(time.time() - start, 2),
-            "error":           error,
-        }
-    except _Timeout:
-        return {"final_answer": "", "tool_call_count": 0,
-                "latency_sec": float(timeout_sec), "error": "TIMEOUT"}
+        return _run_zero_shot_impl(question, options, cutoff_time, timeout_sec=timeout_sec)
     except Exception as e:
-        return {"final_answer": "", "tool_call_count": 0, "latency_sec": 0.0, "error": str(e)}
-    finally:
-        signal.alarm(0)
+        return {"final_answer": "", "tool_call_count": 0, "iteration_count": 0, "latency_sec": 0.0, "error": str(e)}
 
 
 # ── Resume / append helpers ───────────────────────────────────────────────────
@@ -510,7 +499,7 @@ def _process_question_timepoints(
         if result["error"]:
             status = f"ERR({result['error'][:20]})"
         py_str   = f"{agent_prob_yes:.2f}" if agent_prob_yes is not None else "n/a"
-        hyes_str = f"{tp['human_prob_yes']:.2f}" if tp["human_prob_yes"] is not None else "n/a"
+        hyes_str = f"{tp['market_prob_yes']:.2f}" if tp["market_prob_yes"] is not None else "n/a"
         print(f"  → {predicted!r:6}  GT:{item['ground_truth']!r}  {status}  "
               f"agent_yes:{py_str}  human_yes:{hyes_str}  "
               f"tools:{result['tool_call_count']}  {result['latency_sec']}s")
@@ -528,8 +517,8 @@ def _process_question_timepoints(
                     date_context=tp["date"],
                     predicted_yes=agent_prob_yes,
                     predicted_no=agent_prob_no,
-                    market_yes=tp["human_prob_yes"],
-                    market_no=tp["human_prob_no"],
+                    market_yes=tp["market_prob_yes"],
+                    market_no=tp["market_prob_no"],
                     thinking=thinking,
                 )
                 last_conclusion = carry_conclusion
@@ -558,8 +547,8 @@ def _process_question_timepoints(
             "ground_truth":      item["ground_truth"],
             "close_date":        item["close_date"],
             "topic":             item.get("topic", ""),
-            "human_prob_yes":    tp["human_prob_yes"],
-            "human_prob_no":     tp["human_prob_no"],
+            "market_prob_yes":    tp["market_prob_yes"],
+            "market_prob_no":     tp["market_prob_no"],
             "predicted":         predicted,
             "correct":           correct,
             "confidence":        confidence,
@@ -570,6 +559,7 @@ def _process_question_timepoints(
             "carry_conclusion":  carry_conclusion if carry_conclusion else None,
             "carry_critique":    carry_critique if carry_critique else None,
             "tool_call_count":   result["tool_call_count"],
+            "iteration_count":   result.get("iteration_count"),
             "latency_sec":       result["latency_sec"],
             "error":             result["error"],
             "timestamp":         datetime.now(timezone.utc).isoformat(),
@@ -674,77 +664,156 @@ def benchmark_timeseries(
     summarize(results_file)
 
 
+# ── Per-question worker (question-by-question mode) ──────────────────────────
+
+def _process_single_question(
+    item: dict,
+    question_id: str,
+    q_idx: int,
+    total_questions: int,
+    setup: int,
+    is_zs: bool,
+    timeout_sec: int,
+    thinking: bool,
+    results_file: Path,
+    done: set,
+) -> None:
+    """Process a single question (no timepoints). Thread-safe."""
+    if question_id in done:
+        return
+
+    _SETUP_NAMES = {
+        1: "ZS", 2: "ReAct", 3: "ReAct+Refl",
+        4: "ReAct+Concl", 5: "ReAct+Crit",
+        6: "ReAct+C+C", 7: "ReAct+Full",
+    }
+    mode_tag = f"S{setup}({_SETUP_NAMES.get(setup, '?')})"
+    print(f"[Q{q_idx+1}/{total_questions}] [{mode_tag}] {item['question'][:75]}...")
+
+    if is_zs:
+        result = run_zero_shot(item["question"], item["options"],
+                               item["cutoff_date"], timeout_sec)
+    else:
+        result = run_single(item["question"], item["options"],
+                            item["cutoff_date"], timeout_sec,
+                            thinking=thinking, setup=setup)
+
+    # Unified extraction: XML <prediction> → P(Yes): → legacy Confidence:
+    pred = extract_agent_prediction(result["final_answer"], item["options"])
+    predicted      = pred["predicted"]
+    agent_prob_yes = pred["agent_prob_yes"]
+    agent_prob_no  = pred["agent_prob_no"]
+    confidence     = pred["confidence"]
+    refl_text      = extract_reflection(result["final_answer"])
+    self_critique  = extract_self_critique(result["final_answer"])
+
+    correct = (predicted == item["ground_truth"]) if predicted is not None else None
+
+    status = "✓" if correct is True else ("✗" if correct is False else "?")
+    if result["error"]:
+        status = f"ERR({result['error'][:25]})"
+    py_str = f"{agent_prob_yes:.2f}" if agent_prob_yes is not None else "n/a"
+    print(f"  → {predicted!r:6}  GT:{item['ground_truth']!r}  {status}  "
+          f"P(Yes):{py_str}  tools:{result['tool_call_count']}  {result['latency_sec']}s")
+
+    append_record(results_file, {
+        "question_id":     question_id,
+        "setup":           setup,
+        "question":        item["question"],
+        "options":         item["options"],
+        "ground_truth":    item["ground_truth"],
+        "cutoff_date":     item["cutoff_date"],
+        "topic":           item.get("topic", ""),
+        "predicted":       predicted,
+        "correct":         correct,
+        "confidence":      confidence,
+        "agent_prob_yes":  agent_prob_yes,
+        "agent_prob_no":   agent_prob_no,
+        "market_prob_yes": item.get("market_prob_yes"),
+        "market_prob_no":  item.get("market_prob_no"),
+        "reflection":      refl_text,
+        "self_critique":   self_critique,
+        "tool_call_count": result["tool_call_count"],
+        "iteration_count": result.get("iteration_count"),
+        "latency_sec":     result["latency_sec"],
+        "error":           result["error"],
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
+        "final_answer":    result["final_answer"],
+    })
+
+
 # ── Main benchmark loop ───────────────────────────────────────────────────────
 
 def benchmark(max_questions: Optional[int], results_file: Path, timeout_sec: int,
-              reflection: bool = False, zero_shot: bool = False, thinking: bool = True) -> None:
+              reflection: bool = False, zero_shot: bool = False, thinking: bool = True,
+              setup: int | None = None, parallel: int = 1) -> None:
+    """
+    Run the agent (or zero-shot LLM) once per question (no timepoints).
+
+    Args:
+        parallel: Number of questions to process concurrently (default 1 = sequential).
+                  vLLM continuous batching handles concurrent requests efficiently.
+    """
+    # Resolve setup from legacy flags if not explicitly provided
+    if setup is None:
+        if zero_shot:
+            setup = 1
+        elif reflection:
+            setup = 3
+        else:
+            setup = 2
+
+    is_zs = setup in SETUP_IS_ZERO_SHOT
+
+    _SETUP_NAMES = {
+        1: "Zero-Shot", 2: "ReAct", 3: "ReAct+Reflection",
+        4: "ReAct+Conclusion", 5: "ReAct+Critique",
+        6: "ReAct+Concl+Crit", 7: "ReAct+Full",
+    }
+
     dataset = load_polymarket(DATASET_PATH, max_questions)
     done    = load_completed(results_file)
 
     print(f"\n{'='*55}")
+    print(f"Setup   : {setup} — {_SETUP_NAMES.get(setup, '?')}")
+    print(f"Parallel: {parallel} question(s) at a time")
     print(f"Dataset : {len(dataset)} questions")
     print(f"Done    : {len(done)}  |  Remaining: {len(dataset) - len(done)}")
     print(f"Output  : {results_file}")
     print(f"Timeout : {timeout_sec}s/question")
     print(f"{'='*55}\n")
 
-    for i, item in enumerate(dataset):
-        question_id = str(i + 1)
-        if question_id in done:
-            continue
+    worker_kwargs = dict(
+        setup=setup, is_zs=is_zs,
+        timeout_sec=timeout_sec, thinking=thinking,
+        results_file=results_file, done=done,
+    )
 
-        mode_tag = "ZS" if zero_shot else ("R+ref" if reflection else "R")
-        print(f"[Q{i+1}/{len(dataset)}] [{mode_tag}] {item['question'][:75]}...")
-
-        if zero_shot:
-            result = run_zero_shot(item["question"], item["options"],
-                                   item["cutoff_date"], timeout_sec)
-        else:
-            result = run_single(item["question"], item["options"],
-                                item["cutoff_date"], timeout_sec,
-                                reflection=reflection, thinking=thinking)
-
-        # Unified extraction: XML <prediction> → P(Yes): → legacy Confidence:
-        pred = extract_agent_prediction(result["final_answer"], item["options"])
-        predicted      = pred["predicted"]
-        agent_prob_yes = pred["agent_prob_yes"]
-        agent_prob_no  = pred["agent_prob_no"]
-        confidence     = pred["confidence"]
-        refl_text      = extract_reflection(result["final_answer"])
-        self_critique  = extract_self_critique(result["final_answer"])
-
-        correct = (predicted == item["ground_truth"]) if predicted is not None else None
-
-        status = "✓" if correct is True else ("✗" if correct is False else "?")
-        if result["error"]:
-            status = f"ERR({result['error'][:25]})"
-        py_str = f"{agent_prob_yes:.2f}" if agent_prob_yes is not None else "n/a"
-        print(f"  → {predicted!r:6}  GT:{item['ground_truth']!r}  {status}  "
-              f"P(Yes):{py_str}  tools:{result['tool_call_count']}  {result['latency_sec']}s")
-
-        append_record(results_file, {
-            "question_id":     question_id,
-            "question":        item["question"],
-            "options":         item["options"],
-            "ground_truth":    item["ground_truth"],
-            "cutoff_date":     item["cutoff_date"],
-            "topic":           item.get("topic", ""),
-            "predicted":       predicted,
-            "correct":         correct,
-            "confidence":      confidence,
-            "agent_prob_yes":  agent_prob_yes,
-            "agent_prob_no":   agent_prob_no,
-            "market_prob_yes": item.get("market_prob_yes"),
-            "market_prob_no":  item.get("market_prob_no"),
-            "reflection":      refl_text,
-            "self_critique":   self_critique,
-            "tool_call_count": result["tool_call_count"],
-            "latency_sec":     result["latency_sec"],
-            "error":           result["error"],
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
-            "final_answer":    result["final_answer"],
-        })
-        done.add(question_id)
+    if parallel <= 1:
+        # Sequential mode (original behavior)
+        for i, item in enumerate(dataset):
+            _process_single_question(
+                item=item, question_id=str(i + 1),
+                q_idx=i, total_questions=len(dataset),
+                **worker_kwargs,
+            )
+    else:
+        # Parallel mode: process N questions concurrently
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = {}
+            for i, item in enumerate(dataset):
+                f = pool.submit(
+                    _process_single_question,
+                    item=item, question_id=str(i + 1),
+                    q_idx=i, total_questions=len(dataset),
+                    **worker_kwargs,
+                )
+                futures[f] = i
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as exc:
+                    print(f"  [ERROR] Question {futures[f]+1} failed: {exc}")
 
     print(f"\nDone. Results saved to: {results_file}")
     summarize(results_file)
@@ -828,4 +897,5 @@ if __name__ == "__main__":
     else:
         results_file = Path(args.results_file) if args.results_file else auto_file
         benchmark(args.max_questions, results_file, args.timeout,
-                  reflection=args.reflection, zero_shot=args.zero_shot, thinking=thinking)
+                  reflection=args.reflection, zero_shot=args.zero_shot,
+                  thinking=thinking, setup=setup, parallel=args.parallel)

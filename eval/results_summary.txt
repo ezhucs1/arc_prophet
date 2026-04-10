@@ -1,0 +1,246 @@
+======================================================================
+RESULTS SUMMARY & HYPOTHESES — S1 (ZS) vs S2 (ReAct)
+Proof-of-concept run: 1000 questions, --no_thinking, --parallel 8
+Generated: 2026-04-09 (session 6)
+======================================================================
+
+RESULTS
+----------------------------------------------------------------------
+
+- ZS baseline (S1) slightly beats ReAct (S2) on every metric — 75.0%
+  vs 72.0% accuracy, 0.191 vs 0.095 MCC, 0.198 vs 0.207 Brier — but
+  no difference is statistically significant (Brier p=0.37, McNemar
+  p=0.065, Wilcoxon p=0.87).
+
+- Both are barely above random on balanced accuracy — 56.3% (S1) vs
+  53.3% (S2), driven by massive NO bias (~9-10% predicted Yes vs 25.4%
+  ground truth). Raw accuracy is flattering only because the dataset is
+  75% No.
+
+- Market crushes both — Brier Skill Score of -2.45 (S1) and -2.70
+  (S2), meaning agent error is 3-4x worse than Polymarket crowds.
+  Expected: market prices near resolution carry near-perfect information.
+
+- ReAct is 25x slower for no gain — 324s vs 12.9s avg latency, and
+  73.9% of ReAct predictions came from graceful timeout recovery
+  (partial evidence), not clean completion.
+
+- Graceful timeout predictions are equally accurate (72.4% vs 71.0%
+  clean) — validates the timeout recovery mechanism but also raises the
+  question of whether the full research loop adds anything.
+
+
+DISCORDANT CASE ANALYSIS (from JSONL review)
+----------------------------------------------------------------------
+
+Of 1000 matched question pairs:
+  - Both correct:     676
+  - S1-only correct:   83  (retrieval HURT)
+  - S2-only correct:   56  (retrieval HELPED)
+  - Both wrong:        185
+
+Net: retrieval flipped 27 more questions from right to wrong than
+from wrong to right.
+
+Prediction flips between S1 and S2:
+  - S1=No -> S2=Yes:  75 flips, only 32.0% correct (24/75)
+    When retrieval convinced the agent to switch to Yes, it was wrong
+    68% of the time. Reddit evidence was misleading more often than
+    informative.
+
+  - S1=Yes -> S2=No:  64 flips, 50.0% correct (32/64)
+    When retrieval killed a ZS "Yes" instinct, it was a coin flip —
+    no signal, just noise.
+
+S2 is also more extreme: 178 predictions at 0.0 or 1.0 vs S1's 66.
+S2 avg confidence is higher (75.8% vs 70.5%) but less calibrated —
+overconfident on wrong answers (71.4% conf when wrong vs S1's 66.0%).
+
+
+TOOL USAGE ANALYSIS
+----------------------------------------------------------------------
+
+S2 tool call distribution (4,146 total across 1000 questions):
+  search_database:        2,737  (66%)
+  get_comment_core_info:    983  (24%)
+  get_post_core_info:       383   (9%)
+  get_post_comments_list:    22  (0.5%)
+  get_author_history_list:   21  (0.5%)
+
+- 598 questions (61%) used search_database ONLY — never drilled down
+- 382 questions (39%) used mixed tools (search + drilldown)
+- Mixed-tool accuracy: 73.3% vs search-only: 71.2% (+2.1pp)
+- get_post_comments_list and get_author_history_list barely used
+
+
+WHY S2 UNDERPERFORMS S1 — ROOT CAUSES (from JSONL evidence)
+----------------------------------------------------------------------
+
+1. RETRIEVAL INTRODUCES NOISE, NOT SIGNAL
+   The Reddit KB is mismatched to Polymarket questions. When the agent
+   searches and finds Reddit posts, the content is often tangential,
+   outdated, or from unreliable sources. The agent then anchors on this
+   noisy evidence and makes confident wrong predictions.
+
+   Example: Q43 (Senator Eichorn guilty?) — S1 correctly predicts No
+   with 0.1 confidence. S2 finds Reddit comments about the arrest and
+   charges, interprets "charged" as "guilty," and predicts Yes at 0.95.
+   GT=No (not found guilty). The retrieval gave the agent real but
+   misleading information — charges != conviction.
+
+   Example: Q35 (Trump deport 2M+?) — S1 correctly predicts No at 0.1.
+   S2 finds Reddit political commentary about mass deportation *plans*
+   and interprets aspirational policy discussion as likely outcome,
+   predicting Yes at 0.7. GT=No.
+
+2. ABSENCE-OF-EVIDENCE FALLACY GETS WORSE WITH TOOLS
+   S1 has 79 absence-of-evidence errors; S2 has 85. When the agent
+   searches Reddit and finds nothing relevant, it concludes the event
+   is unlikely — "I searched and found no evidence, so No." This is
+   worse than ZS, because ZS at least uses parametric knowledge to
+   reason about base rates. S2 replaces that reasoning with "my search
+   returned nothing."
+
+   Example: Q50 (Atalanta advance?) — S2 searches, finds no relevant
+   results about the specific match, and predicts No at p_yes=0.0.
+   S1 uses general sports knowledge and predicts Yes at 0.6. GT=Yes.
+
+3. REDDIT COMMENTS ≠ GROUND TRUTH
+   The agent treats Reddit user opinions as evidence. Comments saying
+   "Trump will deport millions" or "Senator is obviously guilty" are
+   opinions and speculation, not facts. The agent has no mechanism to
+   assess source reliability or distinguish prediction from reporting.
+   This systematically inflates confidence in wrong directions.
+
+4. TOOL USE MAKES THE MODEL MORE EXTREME AND OVERCONFIDENT
+   S2 produces 178 extreme predictions (p=0.0 or p=1.0) vs S1's 66.
+   After seeing "evidence" (even noisy evidence), the model becomes
+   more certain. S2's overconfidence rate is 33.6% vs S1's 27.2%.
+   The retrieval pipeline turns uncertain-but-calibrated ZS predictions
+   into confident-but-wrong RAG predictions.
+
+5. GRACEFUL TIMEOUT TRUNCATION (COMPUTE ARTIFACT)
+   73.9% of S2 hit graceful timeout with only 4.2 avg tool calls. The
+   agent is being forced to conclude mid-research. But notably, the
+   graceful timeout accuracy (72.4%) equals clean accuracy (71.0%),
+   suggesting more tool calls wouldn't help — the underlying signal
+   quality is the bottleneck, not the quantity of retrieval.
+
+
+BUG FOUND: DOC_ID FORMAT MISMATCH (10% tool budget wasted)
+----------------------------------------------------------------------
+
+search_database returns compound doc_id format:
+  "doc_id": "2025-02:comment:mc806oy"
+
+But get_comment_core_info / get_post_core_info expect plain IDs:
+  "comment_id": "mc806oy"
+
+The agent passes the compound doc_id 25.3% of the time (345/1366
+drilldown calls). Every one fails with "not found."
+
+Impact:
+  - 345 wasted tool calls from wrong ID format
+  -  77 wasted tool calls from legitimate not-found (ID in vector
+     index but not in SQL lookup table)
+  - 422 total not-found errors = 10.2% of all tool calls wasted
+  - With only 4.2 avg tool calls per question, 0.42 calls/question
+    are burned on dead-end lookups
+
+Wrong-format calls account for 81.8% (345/422) of all not-found
+errors. This is a trivially fixable bug.
+
+
+FIXES TO APPLY BEFORE FINAL RUNS (priority order)
+----------------------------------------------------------------------
+
+FIX 1: DOC_ID FORMAT — COORDINATE WITH D AGENT TEAM [BUG]
+  Problem: search results return "2025-02:comment:mc806oy" as doc_id,
+           agent passes this to get_comment_core_info which expects
+           just "mc806oy". 345 wasted tool calls (8.3% of total).
+  Options (pick one):
+    (a) Ask D agent team to accept compound doc_id in lookup endpoints
+    (b) Ask D agent team to strip prefix server-side before lookup
+    (c) Strip prefix in tools.py: extract ID after last ":"
+    (d) Change search results to return object_id prominently
+  Also ask D agent team: remove null/dangling IDs from the vector
+  index that don't exist in SQL (accounts for remaining 77 not-found).
+  Expected gain: recovers ~10% of tool budget (422 calls).
+
+FIX 2: PROMPT DEBIASING — NO BIAS [PROMPT CHANGE]
+  Problem: model predicts Yes only 9-10% vs 25.4% ground truth.
+  Fix: add to system prompt:
+    "Base rates for prediction markets: roughly 20-30% of binary
+    questions resolve Yes. Absence of evidence in the database does
+    NOT mean the event won't happen — it may mean the topic is not
+    discussed on Reddit. If your search returns no relevant results,
+    fall back to your parametric knowledge and base rate reasoning
+    rather than defaulting to No."
+  Expected gain: improved Yes recall (currently 15-18%), better
+  balanced accuracy.
+
+FIX 3: SOURCE RELIABILITY INSTRUCTION [PROMPT CHANGE]
+  Problem: agent treats Reddit opinions as facts, becomes
+  overconfident. "Charged with crime" -> "guilty" (Q43).
+  "Plans to deport" -> "will deport" (Q35).
+  Fix: add to system prompt:
+    "Reddit comments are user opinions, not verified facts. When
+    evaluating evidence, distinguish:
+    (1) Reports of events that already happened (strong evidence)
+    (2) Predictions and opinions about future events (weak evidence)
+    (3) Speculation and hot takes (very weak evidence)
+    Only category (1) should strongly shift your probability. Never
+    let Reddit speculation push your confidence above 0.85 or below
+    0.15 unless you find multiple independent factual reports."
+  Expected gain: reduced overconfidence, fewer extreme predictions
+  (currently 178 at p=0.0 or 1.0 vs S1's 66).
+
+FIX 4: COMPUTE CONFIG — PARALLEL 4 + THINKING ON [RUN CONFIG]
+  Problem: parallel 8 causes 73.9% graceful timeout, only 4.2 avg
+  tool calls. Agent is evaluated in a degraded state.
+  Fix: use --parallel 4 with thinking ON for final paper runs.
+  Expected gain: more tool calls per question, deeper reasoning
+  per call, lower timeout rate. Sequential testing showed 11 tool
+  calls and 0% timeout at sequential; parallel 4 should be in
+  between.
+
+FIX 5: PRIMARY METRICS — BALANCED ACC + MCC [PAPER FRAMING]
+  Problem: raw accuracy (75%, 72%) is misleading on 75% No dataset.
+  A trivial "always No" baseline gets 74.6%.
+  Fix: report Balanced Accuracy and MCC as primary classification
+  metrics. Add per-class recall table (Yes recall vs No recall) as
+  main results. Frame the paper around: "can any setup improve Yes
+  recall without destroying No recall?"
+
+
+ON THE YES/NO QUESTION
+----------------------------------------------------------------------
+
+Should we focus on Yes prediction accuracy? Short answer: YES.
+
+The dataset is 74.6% No. A trivial "always predict No" baseline gets
+74.6% accuracy. Both S1 (75.0%) and S2 (72.0%) are barely above this.
+The real test of whether the agent adds value is:
+
+  - GT=Yes recall (sensitivity):  S1=18.5%, S2=15.3%
+    Both are terrible. The agent catches fewer than 1 in 5 Yes events.
+
+  - GT=No recall (specificity):   S1=94.1%, S2=91.4%
+    Both are very high, but this is the easy case — just say No.
+
+The Balanced Accuracy (56.3% S1, 53.3% S2) averages these two and
+shows both are barely above the 50% random baseline. MCC (which
+accounts for class imbalance) tells the same story: 0.191 and 0.095.
+
+For the paper, the key question is: can any setup (S3-S7) improve
+Yes recall without destroying No recall? That's where the real
+value would be — catching events that ARE going to happen, which is
+the hard and useful prediction task.
+
+
+NOTE ON --no_thinking
+----------------------------------------------------------------------
+--no_thinking (enable_thinking=False) does NOT disable reasoning. The
+model still reasons internally; it just suppresses explicit <think>
+blocks, producing fewer tokens per call. The difference is depth of
+reasoning, not presence/absence of reasoning.

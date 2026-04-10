@@ -1,5 +1,5 @@
 # Reproducibility Guide
-**Last updated:** 2026-04-04
+**Last updated:** 2026-04-08
 
 Everything a reviewer or collaborator needs to reproduce any result from scratch.
 Items marked ⚠️ are gaps that must be filled before paper submission.
@@ -79,9 +79,11 @@ vllm serve Qwen/Qwen3-14B-AWQ \
 
 **Environment variables (`.env` file):**
 ```env
-VLLM_API_BASE=http://127.0.0.1:8002/v1
+VLLM_API_BASE=http://127.0.0.1:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen3-14B-AWQ
 ```
+
+**Note:** The `.env` port MUST match the vLLM `--port` flag. A mismatch (e.g., `.env` says 8002 but vLLM is on 8000) causes all requests to fail with "Connection error" — see CHECKPOINT.md Error 7.
 
 ---
 
@@ -202,7 +204,7 @@ echo "VLLM_MODEL_NAME=Qwen/Qwen3-14B-AWQ" >> .env
 
 # 4. Start vLLM (separate terminal, keep running)
 vllm serve Qwen/Qwen3-14B-AWQ \
-  --host 127.0.0.1 --port 8002 \
+  --host 127.0.0.1 --port 8000 \
   --max-model-len 32768 --quantization awq \
   --enforce-eager --enable-auto-tool-choice \
   --tool-call-parser hermes --generation-config vllm
@@ -210,12 +212,56 @@ vllm serve Qwen/Qwen3-14B-AWQ \
 # 5. Start Text2SQL IPC server (separate terminal, keep running)
 # ⚠️ Command not yet documented — see REPRODUCIBILITY.md §4
 
-# 6. Run zero-shot baseline
-python agent/evals.py --zero_shot --timeseries --max_questions 100
+# 6. Run zero-shot baseline (thinking ON is fine — single fast LLM call)
+python agent/evals.py --setup 1 --max_questions 939 --parallel 8
 
-# 7. Run ReAct agent
-python agent/evals.py --timeseries --max_questions 100
+# 7. Run ReAct agent (--no_thinking recommended for parallel runs)
+python agent/evals.py --setup 2 --max_questions 939 --parallel 8 --no_thinking
 
-# 8. Evaluate
+# 8. Run as background job with logging
+nohup python -u agent/evals.py --setup 2 --max_questions 939 --parallel 8 --no_thinking \
+  > logs/react_s2_nothink.log 2>&1 &
+
+# 9. Monitor progress
+tail -f logs/react_s2_nothink.log         # live output
+wc -l agent/results/results_s2_*.jsonl    # count completed questions
+
+# 10. Run all 7 setups
+for s in 1 2 3 4 5 6 7; do
+  nohup python -u agent/evals.py --setup $s --max_questions 939 --parallel 8 --no_thinking \
+    > logs/react_s${s}_nothink.log 2>&1
+done
+
+# 11. Evaluate
 python eval/eval_forecasting.py agent/results/<file>.jsonl
+
+# 12. Compare two setups
+python eval/eval_forecasting.py results_s1.jsonl --compare results_s2.jsonl
 ```
+
+### CLI Reference
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--setup N` | Setup number 1-7 (see CHECKPOINT.md §3) | 2 (ReAct) |
+| `--parallel N` | Number of questions to process concurrently | 1 (sequential) |
+| `--max_questions N` | Limit number of questions | All |
+| `--timeseries` | Time-series mode (multiple timepoints per question) | Off |
+| `--max_timepoints N` | Cap timepoints per question (evenly spaced) | All |
+| `--timeout N` | Per-question/timepoint timeout in seconds | 300 |
+
+### Timeout Architecture (Important for Reproducibility)
+
+The timeout system uses `threading.Timer` + `threading.Event` (NOT `signal.alarm`/SIGALRM — see CHECKPOINT.md Error 8 for why). When the time budget expires:
+
+1. A `threading.Timer` sets a `cancel_event` after `timeout_sec`
+2. `run_react()` checks this event at 4 points per loop iteration
+3. Per-call HTTP timeout (`min(90s, timeout_sec)`) prevents any single vLLM call from blocking indefinitely
+4. On timeout: a **graceful timeout** mechanism makes one final LLM call (no tools, 1024 tokens, 30s) to extract a `<prediction>` from evidence gathered so far
+5. Results are tagged `GRACEFUL_TIMEOUT` (prediction available) or `TIMEOUT` (extraction failed)
+
+This ensures near-zero data loss from timeouts while maintaining reproducible behavior across threads.
+| `--results_file PATH` | Resume from existing JSONL file | Auto-generate |
+| `--no_thinking` | Disable Qwen3 `<think>` blocks for faster inference | Thinking on |
+| `--zero_shot` | Legacy flag, equivalent to `--setup 1` | — |
+| `--reflection` | Legacy flag, equivalent to `--setup 3` | — |

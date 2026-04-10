@@ -1,0 +1,93 @@
+======================================================================
+P/D AGENT FORECASTING EVALUATION REPORT
+======================================================================
+Generated: 2026-04-09T09:53:04.292295
+Input: agent/results/results_s1_20260408_215821.jsonl
+Total questions: 1000
+
+CONFUSION MATRIX
+--------------------------------------------------
+                      Predicted
+                      Yes      No
+Actual Yes              46     203    (n=249)
+Actual No               43     691    (n=734)
+
+Valid predictions: 983
+Null predictions:  17
+
+CLASSIFICATION METRICS
+--------------------------------------------------
+Accuracy (all):              73.7%
+Accuracy (excl. nulls):      75.0%
+Balanced Accuracy:           56.3%
+
+Metric                        Yes           No
+Precision                   0.517        0.773
+Recall                      0.185        0.941
+F1 Score                    0.272        0.849
+Support                       249          734
+
+AGGREGATE METRICS
+--------------------------------------------------
+F1 Macro:                    0.5605
+F1 Micro:                    0.7497
+F1 Weighted:                 0.7028
+Matthews Correlation (MCC):  0.1912
+Cohen's Kappa:               0.1602
+
+BIAS ANALYSIS
+--------------------------------------------------
+Ground Truth Yes Rate:       25.4%
+Predicted Yes Rate:          9.1%
+Prediction Bias:             -16.3%
+⚠️  Strong NO bias detected
+
+CALIBRATION METRICS
+--------------------------------------------------
+Samples with confidence:     983
+Brier Score:                 0.1978  (lower is better)
+Log Loss:                    0.8060  (lower is better)
+Expected Calibration Error:  0.1164
+Max Calibration Error:       0.6686
+Avg Confidence:              70.5%
+Avg Confidence (correct):    72.1%
+Avg Confidence (wrong):      66.0%
+Overconfidence Rate:         27.2%
+
+OPERATIONAL METRICS
+--------------------------------------------------
+Avg Latency:                 12.9s
+Median Latency:              9.3s
+P95 Latency:                 24.2s
+Max Latency:                 127.8s
+Avg Tool Calls:              0.0
+Max Tool Calls:              0
+Zero Tool Call Rate:         100.0%
+Hard Error Rate:             1.7%  (17 — no prediction produced)
+Timeout Rate:                0.0%
+Token-Limit Rate:            1.7%
+Context-Overflow Rate:       0.0%
+Error breakdown:             {'token_limit': 17}
+
+MARKET COMPARISON
+--------------------------------------------------
+Samples with market probs:   983
+Agent Brier Score:           0.1978  (lower is better; random=0.25)
+Market Brier Score:          0.0573
+Brier Skill Score:           -2.4514  (market beats agent)
+Prob. Correlation (r):       0.2467  (agent_prob_yes vs market_prob_yes)
+Mean Abs. Deviation:         0.3009  (avg |agent_p_yes - market_p_yes|)
+Directional Agreement:       78.5%  (both same side of 50%)
+
+REFLECTION & SELF-CRITIQUE QUALITY
+--------------------------------------------------
+Reflection rate:             0.0%  (0/983)
+Self-critique rate:          0.0%  (0/983)
+
+ERROR PATTERN ANALYSIS
+--------------------------------------------------
+no_tool_calls                         246
+absence_of_evidence_fallacy            79
+null_due_to_error                      17
+
+======================================================================

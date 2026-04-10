@@ -2,7 +2,7 @@
 ## Target Venue: EMNLP 2026 (Main Conference — Evaluation Track)
 
 **Authors:** [To be filled]  
-**Date:** 2026-04-07  
+**Date:** 2026-04-08  
 **Status:** Implementation complete, experiments pending
 
 ---
@@ -264,6 +264,7 @@ We do not pre-register specific numerical predictions, but we state directional 
 | **Market beats agent on everything** | Weak results | Expected. The contribution is the decomposition, not beating the market. Report complementarity (where agent adds value). |
 | **Qwen3-14B too weak** | Floor effect — all setups bad | Acknowledged as limitation. Framework is model-agnostic — results with GPT-4/Claude would differ. |
 | **Resume breaks carry-forward** | Data loss on crash | Known limitation. Carry state isn't persisted to disk. Mitigation: small batches, checkpointing. |
+| **Agent exceeds time budget** | Lost prediction | Graceful timeout: one final LLM call extracts prediction from partial evidence. Tagged `GRACEFUL_TIMEOUT` for sensitivity analysis. |
 
 ---
 
@@ -343,15 +344,22 @@ vllm serve Qwen/Qwen3-14B-AWQ --host 127.0.0.1 --port 8000 \
   --max-model-len 32768 --quantization awq --enforce-eager \
   --enable-auto-tool-choice --tool-call-parser hermes --generation-config vllm
 
-# Run Setup 2 (ReAct), 100 questions, 8 parallel
+# Question-by-question mode (fast — one prediction per question)
+python agent/evals.py --setup 2 --max_questions 100 --parallel 8
+
+# Time-series mode (temporal analysis — multiple timepoints per question)
 python agent/evals.py --timeseries --setup 2 --max_questions 100 --parallel 8
 
-# Run Setup 7 (Full), 100 questions, 8 parallel
-python agent/evals.py --timeseries --setup 7 --max_questions 100 --parallel 8
+# Run all 7 setups
+for s in 1 2 3 4 5 6 7; do
+  python agent/evals.py --setup $s --max_questions 939 --parallel 8
+done
 
 # Compare results
 python eval/eval_forecasting.py results_s2.jsonl --compare results_s7.jsonl
 ```
+
+**Note on `--parallel`:** vLLM's continuous batching handles concurrent requests efficiently. `--parallel 8` sends 8 questions simultaneously, which the GPU processes as a batch. Default `--parallel 1` = sequential (original behavior).
 
 ---
 

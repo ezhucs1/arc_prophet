@@ -165,12 +165,27 @@ class OperationalMetrics:
     max_tool_calls: int = 0
     zero_tool_call_rate: float = 0.0
 
-    # Errors
+    # ReAct loop iterations (None if not recorded in data)
+    avg_iterations: Optional[float] = None
+    median_iterations: Optional[float] = None
+    max_iterations: Optional[int] = None
+
+    # Errors — split into hard errors (no prediction) vs soft (graceful timeout)
     total_errors: int = 0
-    error_rate: float = 0.0
+    error_rate: float = 0.0              # any non-null error field
+    hard_error_count: int = 0            # no prediction produced
+    hard_error_rate: float = 0.0
+    graceful_timeout_count: int = 0      # GRACEFUL_TIMEOUT with valid prediction
+    graceful_timeout_rate: float = 0.0
+    context_limit_count: int = 0        # CONTEXT_LIMIT — context full, predicted from evidence
+    context_limit_rate: float = 0.0
     timeout_rate: float = 0.0
     token_limit_rate: float = 0.0   # finish_reason=length or TOKEN_LIMIT
     context_overflow_rate: float = 0.0  # 400 context window exceeded
+
+    # Accuracy split by completion type
+    accuracy_clean: Optional[float] = None       # rows with no error
+    accuracy_graceful_timeout: Optional[float] = None  # GRACEFUL_TIMEOUT rows
 
     # Error breakdown
     error_types: Dict[str, int] = field(default_factory=dict)
@@ -207,8 +222,8 @@ class MarketComparisonMetrics:
     brier_skill_score: Optional[float] = None  # 1 - (agent_BS / market_BS); >0 means agent beats market
 
     # Probability alignment
-    prob_correlation: Optional[float] = None       # Pearson r(agent_prob_yes, human_prob_yes)
-    mean_absolute_deviation: Optional[float] = None  # avg |agent_prob_yes - human_prob_yes|
+    prob_correlation: Optional[float] = None       # Pearson r(agent_prob_yes, market_prob_yes)
+    mean_absolute_deviation: Optional[float] = None  # avg |agent_prob_yes - market_prob_yes|
 
     # Directional agreement: both sides of 0.5 threshold
     directional_agreement_rate: Optional[float] = None  # agent and market agree on which side of 50%
@@ -268,7 +283,7 @@ class EvaluationReport:
     # Time-series specific (populated when timepoint fields are present)
     timeseries: TimeSeriesMetrics = field(default_factory=TimeSeriesMetrics)
 
-    # Market comparison (populated when human_prob_yes fields are present)
+    # Market comparison (populated when market_prob_yes fields are present)
     market_comparison: MarketComparisonMetrics = field(default_factory=MarketComparisonMetrics)
 
     # Reflection quality (populated when reflection/self_critique fields are present)
@@ -593,8 +608,16 @@ def compute_operational_metrics(data: List[Dict]) -> OperationalMetrics:
         metrics.median_tool_calls = tool_calls_sorted[len(tool_calls) // 2]
         metrics.max_tool_calls = max(tool_calls)
         metrics.zero_tool_call_rate = sum(1 for t in tool_calls if t == 0) / len(tool_calls)
+
+    # ReAct loop iterations (only if recorded)
+    iterations = [d['iteration_count'] for d in data if d.get('iteration_count') is not None]
+    if iterations:
+        iterations_sorted = sorted(iterations)
+        metrics.avg_iterations = sum(iterations) / len(iterations)
+        metrics.median_iterations = iterations_sorted[len(iterations) // 2]
+        metrics.max_iterations = max(iterations)
     
-    # Errors
+    # Errors — separate hard errors (no prediction) from graceful timeouts
     errors = [d for d in data if d.get('error')]
     metrics.total_errors = len(errors)
     metrics.error_rate = safe_divide(len(errors), len(data))
@@ -604,13 +627,16 @@ def compute_operational_metrics(data: List[Dict]) -> OperationalMetrics:
     timeout_count       = 0
     token_limit_count   = 0
     context_overflow_count = 0
+    graceful_timeout_count = 0
 
     for d in errors:
         raw = str(d.get('error', ''))
         msg = raw.lower()
 
-        if raw == 'TOKEN_LIMIT' or raw == 'token_limit':
-            # finish_reason == "length": generation was cut off mid-stream
+        if raw == 'GRACEFUL_TIMEOUT' or msg == 'graceful_timeout':
+            error_types['graceful_timeout'] += 1
+            graceful_timeout_count += 1
+        elif raw == 'TOKEN_LIMIT' or raw == 'token_limit':
             error_types['token_limit'] += 1
             token_limit_count += 1
         elif raw == 'TIMEOUT' or msg == 'timeout':
@@ -618,9 +644,10 @@ def compute_operational_metrics(data: List[Dict]) -> OperationalMetrics:
             timeout_count += 1
         elif raw == 'Iteration limit reached' or 'iteration limit' in msg:
             error_types['iteration_limit'] += 1
-        elif raw in ('CONTEXT_LIMIT', 'context_limit') or \
-                'input_tokens' in msg or 'context length' in msg or 'maximum input length' in msg:
-            # CONTEXT_LIMIT = guard triggered cleanly; 400 BadRequest = guard missed
+        elif raw in ('CONTEXT_LIMIT', 'context_limit'):
+            error_types['context_limit'] += 1
+            context_overflow_count += 1
+        elif 'input_tokens' in msg or 'context length' in msg or 'maximum input length' in msg:
             error_types['context_overflow'] += 1
             context_overflow_count += 1
         elif 'recursion' in msg:
@@ -630,11 +657,33 @@ def compute_operational_metrics(data: List[Dict]) -> OperationalMetrics:
         else:
             error_types['other'] += 1
 
+    # Hard errors = no prediction produced at all
+    hard_errors = [d for d in data if d.get('predicted') is None]
+    metrics.hard_error_count = len(hard_errors)
+    metrics.hard_error_rate = safe_divide(len(hard_errors), len(data))
+
+    # Graceful timeouts that still produced predictions
+    metrics.graceful_timeout_count = graceful_timeout_count
+    metrics.graceful_timeout_rate = safe_divide(graceful_timeout_count, len(data))
+
     metrics.timeout_rate        = safe_divide(timeout_count, len(data))
     metrics.token_limit_rate    = safe_divide(token_limit_count, len(data))
     metrics.context_overflow_rate = safe_divide(context_overflow_count, len(data))
     metrics.error_types = dict(error_types)
-    
+
+    # Accuracy split by completion type
+    clean_recs = [d for d in data if not d.get('error') and d.get('predicted') is not None]
+    gt_recs = [d for d in data
+               if str(d.get('error', '')).upper() in ('GRACEFUL_TIMEOUT', 'CONTEXT_LIMIT')
+               and d.get('predicted') is not None]
+
+    if clean_recs:
+        metrics.accuracy_clean = safe_divide(
+            sum(1 for d in clean_recs if d.get('correct')), len(clean_recs))
+    if gt_recs:
+        metrics.accuracy_graceful_timeout = safe_divide(
+            sum(1 for d in gt_recs if d.get('correct')), len(gt_recs))
+
     return metrics
 
 
@@ -844,7 +893,7 @@ def compute_timeseries_metrics(data: List[Dict]) -> TimeSeriesMetrics:
 def compute_market_comparison_metrics(data: List[Dict]) -> MarketComparisonMetrics:
     """Compare agent P(Yes) estimates against prediction market probabilities.
 
-    Requires both 'agent_prob_yes' and 'human_prob_yes' fields.
+    Requires both 'agent_prob_yes' and 'market_prob_yes' fields.
     Only records where both are non-null and ground_truth is known are used.
     """
     metrics = MarketComparisonMetrics()
@@ -852,7 +901,7 @@ def compute_market_comparison_metrics(data: List[Dict]) -> MarketComparisonMetri
     valid = [
         r for r in data
         if extract_prob_yes_from_record(r) is not None
-        and r.get('human_prob_yes') is not None
+        and r.get('market_prob_yes') is not None
         and r.get('ground_truth') is not None
     ]
     if len(valid) < 5:
@@ -862,7 +911,7 @@ def compute_market_comparison_metrics(data: List[Dict]) -> MarketComparisonMetri
     metrics.n_samples = len(valid)
 
     agent_probs  = [extract_prob_yes_from_record(r) for r in valid]
-    market_probs = [float(r['human_prob_yes'])      for r in valid]
+    market_probs = [float(r['market_prob_yes'])      for r in valid]
     actuals      = [1 if r['ground_truth'] == 'Yes' else 0 for r in valid]
 
     n = len(valid)
@@ -1077,12 +1126,23 @@ def format_text_report(report: EvaluationReport) -> str:
     lines.append(f"Avg Tool Calls:              {op.avg_tool_calls:.1f}")
     lines.append(f"Max Tool Calls:              {op.max_tool_calls}")
     lines.append(f"Zero Tool Call Rate:         {op.zero_tool_call_rate:.1%}")
-    lines.append(f"Error Rate:                  {op.error_rate:.1%}  ({op.total_errors} total)")
+    if op.avg_iterations is not None:
+        lines.append(f"Avg ReAct Iterations:        {op.avg_iterations:.1f}")
+        lines.append(f"Median ReAct Iterations:     {op.median_iterations:.1f}")
+        lines.append(f"Max ReAct Iterations:        {op.max_iterations}")
+    lines.append(f"Hard Error Rate:             {op.hard_error_rate:.1%}  "
+                 f"({op.hard_error_count} — no prediction produced)")
+    if op.graceful_timeout_count > 0:
+        lines.append(f"Graceful Timeout Rate:       {op.graceful_timeout_rate:.1%}  "
+                     f"({op.graceful_timeout_count} — prediction recovered via timeout handler)")
     lines.append(f"Timeout Rate:                {op.timeout_rate:.1%}")
     lines.append(f"Token-Limit Rate:            {op.token_limit_rate:.1%}")
     lines.append(f"Context-Overflow Rate:       {op.context_overflow_rate:.1%}")
     if op.error_types:
         lines.append(f"Error breakdown:             {op.error_types}")
+    if op.accuracy_clean is not None and op.accuracy_graceful_timeout is not None:
+        lines.append(f"Accuracy (clean):            {op.accuracy_clean:.1%}")
+        lines.append(f"Accuracy (graceful timeout): {op.accuracy_graceful_timeout:.1%}")
     lines.append("")
 
     # Time-series metrics
@@ -1122,7 +1182,7 @@ def format_text_report(report: EvaluationReport) -> str:
             lines.append(f"Brier Skill Score:           {sign}{mc.brier_skill_score:.4f}  ({verdict})")
         if mc.prob_correlation is not None:
             lines.append(f"Prob. Correlation (r):       {mc.prob_correlation:.4f}  "
-                         f"(agent_prob_yes vs human_prob_yes)")
+                         f"(agent_prob_yes vs market_prob_yes)")
         if mc.mean_absolute_deviation is not None:
             lines.append(f"Mean Abs. Deviation:         {mc.mean_absolute_deviation:.4f}  "
                          f"(avg |agent_p_yes - market_p_yes|)")
@@ -1152,16 +1212,20 @@ def format_text_report(report: EvaluationReport) -> str:
                          f"({sign}{delta:.1%} vs without)")
         lines.append("")
 
-    # By topic
-    lines.append("METRICS BY TOPIC")
-    lines.append("-" * 50)
-    lines.append(f"{'Topic':<20} {'Acc':>8} {'F1-Yes':>8} {'F1-No':>8} {'F1-M':>8} {'N':>6}")
-    for topic, tm in sorted(report.by_topic.items(), key=lambda x: x[1].n_samples, reverse=True):
-        lines.append(
-            f"{topic:<20} {tm.accuracy:>8.1%} {tm.f1_yes:>8.3f} {tm.f1_no:>8.3f} "
-            f"{tm.f1_macro:>8.3f} {tm.n_samples:>6}"
-        )
-    lines.append("")
+    # By topic — skip if only one blank/unknown topic (no useful breakdown)
+    topics = report.by_topic
+    has_real_topics = any(t.strip() not in ('', 'unknown') for t in topics)
+    if has_real_topics:
+        lines.append("METRICS BY TOPIC")
+        lines.append("-" * 50)
+        lines.append(f"{'Topic':<20} {'Acc':>8} {'F1-Yes':>8} {'F1-No':>8} {'F1-M':>8} {'N':>6}")
+        for topic, tm in sorted(topics.items(), key=lambda x: x[1].n_samples, reverse=True):
+            label = topic if topic.strip() else "(no topic)"
+            lines.append(
+                f"{label:<20} {tm.accuracy:>8.1%} {tm.f1_yes:>8.3f} {tm.f1_no:>8.3f} "
+                f"{tm.f1_macro:>8.3f} {tm.n_samples:>6}"
+            )
+        lines.append("")
 
     # Error patterns
     if report.common_error_patterns:
@@ -1213,9 +1277,17 @@ def format_csv_report(report: EvaluationReport) -> str:
     lines.append(f"avg_latency_sec,{op.avg_latency_sec:.2f},operational")
     lines.append(f"p95_latency_sec,{op.p95_latency_sec:.2f},operational")
     lines.append(f"avg_tool_calls,{op.avg_tool_calls:.2f},operational")
-    lines.append(f"error_rate,{op.error_rate:.4f},operational")
+    if op.avg_iterations is not None:
+        lines.append(f"avg_iterations,{op.avg_iterations:.2f},operational")
+        lines.append(f"max_iterations,{op.max_iterations},operational")
+    lines.append(f"hard_error_rate,{op.hard_error_rate:.4f},operational")
+    lines.append(f"graceful_timeout_rate,{op.graceful_timeout_rate:.4f},operational")
     lines.append(f"token_limit_rate,{op.token_limit_rate:.4f},operational")
     lines.append(f"context_overflow_rate,{op.context_overflow_rate:.4f},operational")
+    if op.accuracy_clean is not None:
+        lines.append(f"accuracy_clean,{op.accuracy_clean:.4f},operational")
+    if op.accuracy_graceful_timeout is not None:
+        lines.append(f"accuracy_graceful_timeout,{op.accuracy_graceful_timeout:.4f},operational")
 
     # Time-series metrics
     ts = report.timeseries
@@ -1452,10 +1524,11 @@ def wilcoxon_signed_rank(diffs: List[float]) -> Dict[str, float]:
     }
 
 
-def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
+def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000
+                   ) -> Tuple[str, Dict[str, Any]]:
     """
     Statistical comparison between two result files.
-    Returns formatted text report with bootstrap CI, McNemar, and Wilcoxon tests.
+    Returns (formatted_text, structured_dict) with bootstrap CI, McNemar, and Wilcoxon tests.
     """
     preds_a = _load_predictions_by_key(file_a)
     preds_b = _load_predictions_by_key(file_b)
@@ -1463,7 +1536,8 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     # Find matched keys
     common_keys = sorted(set(preds_a.keys()) & set(preds_b.keys()))
     if not common_keys:
-        return "ERROR: No matched question-timepoint pairs found between the two files."
+        msg = "ERROR: No matched question-timepoint pairs found between the two files."
+        return msg, {"error": msg}
 
     matched_a = [preds_a[k] for k in common_keys]
     matched_b = [preds_b[k] for k in common_keys]
@@ -1473,6 +1547,12 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     name_b = file_b.split("/")[-1]
     setup_a = matched_a[0].get("setup", "?")
     setup_b = matched_b[0].get("setup", "?")
+
+    structured: Dict[str, Any] = {
+        "file_a": name_a, "file_b": name_b,
+        "setup_a": setup_a, "setup_b": setup_b,
+        "matched_pairs": len(common_keys),
+    }
 
     lines = []
     lines.append("=" * 65)
@@ -1486,9 +1566,15 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     brier_a, brier_b = _paired_brier_scores(matched_a, matched_b)
     if brier_a:
         boot = bootstrap_ci(brier_a, brier_b, n_bootstrap=n_bootstrap)
+        mean_a = sum(brier_a) / len(brier_a)
+        mean_b = sum(brier_b) / len(brier_b)
+        structured["brier_bootstrap"] = {
+            "mean_brier_a": round(mean_a, 4), "mean_brier_b": round(mean_b, 4),
+            **boot,
+        }
         lines.append(f"\n--- Brier Score (Paired Bootstrap, n={boot['n']}) ---")
-        lines.append(f"  Mean Brier A:  {sum(brier_a)/len(brier_a):.4f}")
-        lines.append(f"  Mean Brier B:  {sum(brier_b)/len(brier_b):.4f}")
+        lines.append(f"  Mean Brier A:  {mean_a:.4f}")
+        lines.append(f"  Mean Brier B:  {mean_b:.4f}")
         lines.append(f"  Δ (A - B):     {boot['mean_diff']:+.4f}  "
                       f"95% CI [{boot['ci_lower']:+.4f}, {boot['ci_upper']:+.4f}]")
         lines.append(f"  p-value:       {boot['p_value']:.4f}"
@@ -1507,6 +1593,10 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     acc_a = sum(correct_a) / len(correct_a) if correct_a else 0
     acc_b = sum(correct_b) / len(correct_b) if correct_b else 0
     mcn = mcnemar_test(correct_a, correct_b)
+    structured["mcnemar"] = {
+        "accuracy_a": round(acc_a, 4), "accuracy_b": round(acc_b, 4),
+        **mcn,
+    }
     lines.append(f"\n--- Accuracy (McNemar's Test, n={len(common_keys)}) ---")
     lines.append(f"  Accuracy A:    {acc_a:.4f}")
     lines.append(f"  Accuracy B:    {acc_b:.4f}")
@@ -1522,6 +1612,7 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     if brier_a:
         brier_diffs = [a - b for a, b in zip(brier_a, brier_b)]
         wilc = wilcoxon_signed_rank(brier_diffs)
+        structured["wilcoxon"] = wilc
         lines.append(f"\n--- Brier Difference (Wilcoxon Signed-Rank, n={wilc['n']}) ---")
         lines.append(f"  W+:            {wilc['W_plus']:.1f}  (A worse)")
         lines.append(f"  W-:            {wilc['W_minus']:.1f}  (B worse)")
@@ -1537,7 +1628,7 @@ def compare_setups(file_a: str, file_b: str, n_bootstrap: int = 10000) -> str:
     lines.append("Positive Δ Brier = A has higher (worse) Brier score")
     lines.append("=" * 65)
 
-    return "\n".join(lines)
+    return "\n".join(lines), structured
 
 
 # =============================================================================
@@ -1590,12 +1681,15 @@ Examples:
 
     # --- Compare mode ---
     if args.compare:
-        report = compare_setups(args.input_file, args.compare,
-                                n_bootstrap=args.bootstrap_n)
+        text_report, structured = compare_setups(args.input_file, args.compare,
+                                                 n_bootstrap=args.bootstrap_n)
         if not args.quiet:
-            print(report)
+            print(text_report)
         if args.output:
-            Path(args.output).write_text(report)
+            if args.format == 'json':
+                Path(args.output).write_text(json.dumps(structured, indent=2))
+            else:
+                Path(args.output).write_text(text_report)
             if not args.quiet:
                 print(f"\nComparison saved to {args.output}")
         sys.exit(0)

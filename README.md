@@ -1,52 +1,67 @@
 # ARC — Agent Research & Curation
 
-A ReAct agent evaluation system for binary forecasting on Polymarket questions.
-The agent answers yes/no prediction market questions by searching a Reddit knowledge base,
-and is evaluated in a time-series manner — once per historical price timepoint per question —
-to compare agent probability estimates against human (market) probabilities over time.
+A retrieval-augmented LLM agent evaluation system for binary forecasting on Polymarket questions, targeting EMNLP 2026. The agent (Qwen3-14B-AWQ) answers yes/no prediction market questions by searching a Reddit knowledge base. Evaluated across **7 experimental setups** that ablate tools, reflection, and carry-forward belief revision.
 
 ## Overview
 
 ```
-Polymarket JSONL dataset
+Polymarket JSONL dataset (939 binary yes/no questions)
         ↓
-agent/evals.py          ← benchmark harness (single-pass or time-series)
-        ↓ per question / per timepoint
+agent/evals.py          ← benchmark harness (question-by-question or time-series)
+        ↓ per question (parallel via --parallel N)
 agent/react_agent.py    ← ReAct while-loop (LLM + tools, max 20 iterations)
         ↓
 shared/llm.py           ← OpenAI-compatible client (vLLM / Qwen3-14B-AWQ)
         ↓ tool calls
-agent/tools.py          ← 5 tools: search, post, comment, thread, author history
+agent/tools.py          ← 5 tools: hybrid/vector search, post, comment, thread, author
         ↓
-d_agent_client/client.py ← IPC TCP client → Text2SQL server → Reddit DB
+d_agent_client/client.py ← IPC TCP client → Text2SQL server → Reddit DB (19 subreddits)
         ↓
-agent/results/*.jsonl   ← one record per (question, timepoint)
-        ↓ optional
-eval/eval_forecasting.py ← calibration, classification, operational metrics
+agent/results/*.jsonl   ← one record per (question[, timepoint])
+        ↓
+eval/eval_forecasting.py ← metrics + statistical comparison (bootstrap CI, McNemar, Wilcoxon)
 ```
+
+## 7-Setup Experiment Framework
+
+| Setup | Name | Tools | Reflection | Carry-Forward |
+|-------|------|-------|------------|---------------|
+| 1 | Zero-Shot | No | No | No |
+| 2 | ReAct | Yes | No | No |
+| 3 | ReAct + Reflection | Yes | Yes | No |
+| 4 | ReAct + Conclusion Carry | Yes | No | Conclusion |
+| 5 | ReAct + Self-Critique Carry | Yes | No | Critique |
+| 6 | ReAct + Both Carry | Yes | No | Both |
+| 7 | ReAct + Full | Yes | Yes | Both |
+
+**Research questions answered by each comparison:**
+- Setup 1 vs 2: Does retrieval improve calibration? (RQ1)
+- Setup 2 vs 3: Does reflection improve prediction quality? (RQ2)
+- Setup 2 vs 4/5/6: Does cross-timepoint memory help? (RQ3)
+- Setup 4 vs 5: Which carry-forward type is more effective? (RQ4)
+- Setup 6 vs 7: Does combining all components help? (RQ5)
 
 ## Project Structure
 
 ```
 arc/
 ├── agent/
-│   ├── react_agent.py      # ReAct loop: LLM → tool calls → repeat → final answer
-│   ├── tools.py            # 5 OpenAI-schema tools for Reddit DB access
-│   ├── prompts.py          # System prompt: reasoning discipline + reflection
-│   ├── evals.py            # Benchmark harness: single-pass and time-series modes
+│   ├── react_agent.py      # ReAct loop + carry-forward generation
+│   ├── tools.py            # 5 tools (hybrid/vector search, post, comment, thread, author)
+│   ├── prompts.py          # 7 setup prompts + carry-forward templates + XML output
+│   ├── evals.py            # Benchmark harness: question-by-question + time-series, parallel
 │   └── results/            # Output JSONL files (gitignored)
 ├── database/
-│   ├── loader.py           # Polymarket dataset loaders
-│   ├── polymarket_binary_yesno.jsonl         # All binary markets (~361 MB, gitignored)
-│   ├── polymarket_binary_weekly_plus.jsonl   # Markets open ≥1 week (~212 MB, gitignored)
-│   ├── polymarket_binary_monthly_plus.jsonl  # Markets open ≥1 month (~47 MB, gitignored)
-│   └── polymarket_binary_yearly_plus.jsonl   # Markets open ≥1 year (~382 KB, gitignored)
+│   ├── loader.py           # Polymarket dataset loaders (single + time-series)
+│   └── *.jsonl             # Polymarket datasets (gitignored, ~361 MB primary)
 ├── d_agent_client/
 │   └── client.py           # IPC TCP client to Text2SQL server (127.0.0.1:61001)
 ├── eval/
-│   └── eval_forecasting.py # Full metrics: Brier, ECE, MCC, F1, per-topic breakdown
+│   ├── eval_forecasting.py # Metrics suite + statistical comparison mode
+│   └── results_to_html.py  # JSONL → HTML viewer with collapsible tool/thinking sections
 ├── shared/
 │   └── llm.py              # LLM client init from .env
+├── paper/                  # Research documentation (see below)
 ├── run.py                  # Single interactive query CLI
 ├── pyproject.toml
 └── requirements.txt
@@ -56,7 +71,7 @@ arc/
 
 ### Requirements
 
-- Python 3.12
+- Python 3.12+
 - vLLM server running locally (default: `http://127.0.0.1:8000/v1`)
 - Text2SQL IPC server running locally (default: `127.0.0.1:61001`)
 
@@ -77,97 +92,134 @@ VLLM_API_BASE=http://127.0.0.1:8000/v1
 VLLM_MODEL_NAME=Qwen/Qwen3-14B-AWQ
 ```
 
-## Usage
-
-### Single interactive query
+### Start Infrastructure
 
 ```bash
-python run.py --query "Will Bitcoin hit 100k by Feb 2026?" --cutoff_time 2026-02-01
-python run.py --query "Will inflation drop below 3%?" --cutoff_time 2026-01-01 --options Yes No
+# vLLM server (separate terminal, keep running)
+vllm serve Qwen/Qwen3-14B-AWQ \
+  --host 127.0.0.1 --port 8000 \
+  --max-model-len 32768 --quantization awq \
+  --enforce-eager --enable-auto-tool-choice \
+  --tool-call-parser hermes --generation-config vllm
+
+# Text2SQL IPC server (separate terminal, keep running)
+# See d_agent_client/d_agent_usage.md for details
 ```
 
-### Single-pass benchmark (one result per question)
+## Usage
+
+### Quick Start — Question-by-Question (Recommended)
 
 ```bash
-# Run 10 questions
-python agent/evals.py --max_questions 10
+# Zero-shot baseline (thinking ON is fine — single fast LLM call)
+python agent/evals.py --setup 1 --max_questions 939 --parallel 8
 
-# Run full dataset
-python agent/evals.py
+# ReAct agent (--no_thinking recommended for parallel runs — see note below)
+python agent/evals.py --setup 2 --max_questions 939 --parallel 8 --no_thinking
 
-# Resume from existing results file
-python agent/evals.py --results_file agent/results/results_XXXXXX.jsonl
+# Run as background job with logging
+nohup python -u agent/evals.py --setup 2 --max_questions 939 --parallel 8 --no_thinking \
+  > logs/react_s2_nothink.log 2>&1 &
+
+# Monitor progress
+tail -f logs/react_s2_nothink.log
+wc -l agent/results/results_s2_*.jsonl
+
+# All 7 setups
+for s in 1 2 3 4 5 6 7; do
+  python agent/evals.py --setup $s --max_questions 939 --parallel 8 --no_thinking
+done
+```
+
+> **Why `--no_thinking` for ReAct?** With thinking ON + `--parallel 8`, GPU contention causes each LLM call to take ~150s. The agent only manages 1-2 tool calls before the 300s timeout — barely researching. With thinking OFF, calls take ~5-15s, enabling 5-8 tool calls within budget. More evidence gathered = better predictions. See `paper/FINDINGS.md` Finding 9.
+
+### Time-Series Mode (Temporal Analysis)
+
+```bash
+# Time-series with carry-forward (needed for setups 4-7)
+python agent/evals.py --timeseries --setup 7 --max_questions 100 --parallel 8
+
+# Cap timepoints per question
+python agent/evals.py --timeseries --setup 2 --max_questions 100 --max_timepoints 10 --parallel 8
+```
+
+### Evaluate and Compare
+
+```bash
+# Single setup metrics
+python eval/eval_forecasting.py agent/results/results_s2_XXXXXX.jsonl
+
+# Statistical comparison between two setups
+python eval/eval_forecasting.py results_s1.jsonl --compare results_s2.jsonl
+
+# Export all formats
+python eval/eval_forecasting.py results.jsonl --format all --output-dir ./eval_results/
+```
+
+### Other Operations
+
+```bash
+# Resume interrupted run
+python agent/evals.py --setup 2 --parallel 8 --results_file agent/results/results_s2_XXXXXX.jsonl
 
 # Summarize existing results
 python agent/evals.py --summarize agent/results/results_XXXXXX.jsonl
+
+# Single interactive query
+python run.py --query "Will Bitcoin hit 100k by Feb 2026?" --cutoff_time 2026-02-01
+
+# Use a different dataset variant
+python agent/evals.py --setup 2 --dataset database/polymarket_binary_monthly_plus.jsonl
 ```
 
-### Time-series benchmark (one result per question per timepoint)
+### CLI Flags
 
-```bash
-# Full time series — recommended for first run to collect all data
-python agent/evals.py --timeseries --max_questions 10
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--setup N` | Setup number 1-7 | 2 (ReAct) |
+| `--parallel N` | Concurrent questions (vLLM batches automatically) | 1 (sequential) |
+| `--max_questions N` | Limit number of questions | All |
+| `--timeseries` | Time-series mode (multiple timepoints per question) | Off |
+| `--max_timepoints N` | Cap timepoints per question (evenly spaced) | All |
+| `--timeout N` | Per-question timeout in seconds | 300 |
+| `--results_file PATH` | Resume from existing JSONL | Auto-generate |
+| `--no_thinking` | Disable `<think>` blocks for faster inference | Thinking on |
+| `--dataset PATH` | Path to dataset JSONL | `polymarket_binary_yesno.jsonl` |
 
-# Cap timepoints per question (evenly spaced)
-python agent/evals.py --timeseries --max_questions 100 --max_timepoints 10
+## Output Format
 
-# Use a different dataset (weekly/monthly/yearly)
-python agent/evals.py --timeseries --dataset database/polymarket_binary_monthly_plus.jsonl
-
-# Resume a time-series run
-python agent/evals.py --timeseries --results_file agent/results/results_ts_XXXXXX.jsonl
-
-# Custom timeout per timepoint (default: 300s)
-python agent/evals.py --timeseries --max_questions 50 --timeout 180
+All setups produce structured XML predictions (Prompt v4):
+```xml
+<prediction>
+  <yes>0.72</yes>
+  <no>0.28</no>
+  <reasoning>2-4 sentence explanation</reasoning>
+</prediction>
 ```
 
-Time-series result files are named `results_ts_YYYYMMDD_HHMMSS.jsonl` to distinguish them
-from single-pass results (`results_YYYYMMDD_HHMMSS.jsonl`).
+### Result Record Fields
 
-### Comprehensive metrics analysis
-
-```bash
-python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl
-python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl --output report.json
-python eval/eval_forecasting.py agent/results/results_ts_XXXXXX.jsonl --format all --output-dir ./eval_results/
-```
-
-## Output Schema
-
-### Single-pass result record
-
-| Field | Description |
-|---|---|
-| `question_id` | Sequential question index |
-| `question` | Question text |
-| `options` | Always `["Yes", "No"]` |
-| `ground_truth` | Resolved market outcome |
-| `cutoff_date` | Market close date (agent's cutoff) |
-| `topic` | Market category |
-| `predicted` | Agent's selected option |
-| `correct` | Whether prediction matches ground truth |
-| `confidence` | Agent's stated confidence (0.0–1.0) |
-| `agent_prob_yes` / `agent_prob_no` | Agent probabilities derived from confidence |
-| `market_prob_yes` / `market_prob_no` | Human market probability at close date |
-| `reflection` | Last reflection block from agent reasoning |
-| `self_critique` | Agent's pre-commit counter-argument |
-| `tool_call_count` | Number of tool calls made |
-| `latency_sec` | Wall-clock seconds |
-| `error` | Error message or `null` |
-| `timestamp` | UTC timestamp of record creation |
-| `final_answer` | Raw LLM output (reasoning + answer) |
-
-### Time-series result record
-
-Same as above, with these differences/additions:
-
-| Field | Description |
-|---|---|
-| `timepoint_index` | Position in the time series (1-based) |
-| `timepoint_date` | Date used as agent's cutoff (NOT the close date) |
-| `total_timepoints` | Total timepoints for this question |
-| `close_date` | Market resolution date (stored for reference, never sent to agent) |
-| `human_prob_yes` / `human_prob_no` | Market probability at this specific timepoint |
+| Field | Q-by-Q | Time-Series | Description |
+|---|---|---|---|
+| `question_id` | ✓ | ✓ | Sequential question index |
+| `setup` | ✓ | ✓ | Setup number (1-7) |
+| `question` | ✓ | ✓ | Question text |
+| `options` | ✓ | ✓ | Always `["Yes", "No"]` |
+| `ground_truth` | ✓ | ✓ | Resolved market outcome |
+| `cutoff_date` | ✓ | — | Market close date (agent's cutoff) |
+| `timepoint_index` | — | ✓ | Position in time series (1-based) |
+| `timepoint_date` | — | ✓ | Date used as cutoff (NOT close date) |
+| `total_timepoints` | — | ✓ | Total timepoints for this question |
+| `close_date` | — | ✓ | Market resolution date (never sent to agent) |
+| `predicted` | ✓ | ✓ | Agent's selected option ("Yes"/"No") |
+| `agent_prob_yes` / `agent_prob_no` | ✓ | ✓ | Agent probabilities from XML |
+| `market_prob_yes` / `market_prob_no` | ✓ | ✓ | Market probability |
+| `reflection` | ✓ | ✓ | Reflection block (setups 3, 7) |
+| `self_critique` | ✓ | ✓ | Self-critique text |
+| `carry_conclusion` / `carry_critique` | — | ✓ | Carry-forward XML (setups 4-7) |
+| `tool_call_count` | ✓ | ✓ | Number of tool calls made |
+| `latency_sec` | ✓ | ✓ | Wall-clock seconds |
+| `error` | ✓ | ✓ | `null`, `GRACEFUL_TIMEOUT`, `TIMEOUT`, `TOKEN_LIMIT`, or error message |
 
 ## Agent Design
 
@@ -178,13 +230,15 @@ Plain while-loop, no frameworks. Each iteration:
 2. If response has tool calls → execute → append results → continue
 3. If no tool calls → return final answer
 
-Max 20 iterations. 300-second timeout per question/timepoint.
+Max 20 iterations. 300-second timeout per question/timepoint. Full reasoning trace captured across all iterations.
+
+**Timeout handling:** Uses `threading.Timer` + `threading.Event` for reliable timeout across all threads (SIGALRM is unreliable during C-extension calls). When the budget expires, a **graceful timeout** makes one final LLM call (no tools) to extract a prediction from evidence gathered so far. Results tagged `GRACEFUL_TIMEOUT` (got prediction) or `TIMEOUT` (extraction failed).
 
 ### Tools (`agent/tools.py`)
 
 | Tool | Purpose |
 |---|---|
-| `search_database` | Hybrid semantic + keyword search across Reddit posts/comments |
+| `search_database` | Vector semantic search across Reddit posts/comments (default). Hybrid mode available but slower. Supports `month`, `authors`, `subreddit` filters. |
 | `get_post_core_info` | Full content and metadata for a specific post |
 | `get_comment_core_info` | Full content and metadata for a specific comment |
 | `get_post_comments_list` | Thread context around a comment (ancestors + descendants) |
@@ -192,40 +246,19 @@ Max 20 iterations. 300-second timeout per question/timepoint.
 
 All tools respect `cutoff_time` — results are filtered to dates before the cutoff.
 
-### Reflection (`agent/prompts.py`)
-
-The agent is instructed to produce a structured `Reflection:` block every 3 tool calls:
-
-```
-Reflection:
-  Evidence for Yes: ...
-  Evidence for No: ...
-  Gaps / uncertainties: ...
-  Current belief: Yes=0.X | No=0.X
-  Next action: GATHER MORE — reason | CONCLUDE — reason
-```
-
-Before the final answer, the agent also writes a `Self-critique:` — the strongest
-counter-argument to its conclusion, with an explicit check for absence-of-evidence
-vs evidence-of-absence confusion.
-
-Both fields are extracted and stored in the result record for research analysis.
-
-### Datasets
-
-All datasets are Polymarket binary yes/no markets with daily `history_prices` snapshots.
-The `_plus` variants filter for markets that were open for at least that duration,
-giving questions with more historical timepoints.
-
-| Dataset | Size | Description |
-|---|---|---|
-| `polymarket_binary_yesno.jsonl` | ~361 MB | All binary markets |
-| `polymarket_binary_weekly_plus.jsonl` | ~212 MB | Markets open ≥1 week |
-| `polymarket_binary_monthly_plus.jsonl` | ~47 MB | Markets open ≥1 month |
-| `polymarket_binary_yearly_plus.jsonl` | ~382 KB | Markets open ≥1 year |
-
 ### Data Leakage Prevention
 
-In time-series mode, the agent receives only the **timepoint date** as its cutoff —
-the market's close/resolution date is never passed to the agent. This prevents the
-agent from searching for news about the outcome on or after resolution day.
+The agent receives only the **cutoff date** (timepoint date in time-series mode, close date in question-by-question mode). The market's resolution date is never passed to the agent, preventing the agent from searching for outcome-revealing news.
+
+## Research Documentation
+
+| File | Contents |
+|------|----------|
+| `paper/PROPOSAL.md` | Full research proposal for EMNLP 2026 |
+| `paper/CHECKPOINT.md` | Project state, architecture, error history, workflow |
+| `paper/EXPERIMENTS.md` | Result file → run condition mapping, planned runs |
+| `paper/DECISIONS.md` | 10 design decisions (all resolved) |
+| `paper/FINDINGS.md` | Empirical findings from prior runs |
+| `paper/PROMPTS_VERSIONED.md` | Exact prompt text for each version (v2-v4) |
+| `paper/DATASET.md` | Dataset documentation and statistics |
+| `paper/REPRODUCIBILITY.md` | Hardware, software, setup guide for reviewers |

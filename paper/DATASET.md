@@ -109,7 +109,7 @@ The `topic` field is populated from `source_payload.category` but is empty in al
 
 ## 4. Human (Market) Probability
 
-For each timepoint, `human_prob_yes` and `human_prob_no` are the Polymarket prices at that date:
+For each timepoint, `market_prob_yes` and `market_prob_no` are the Polymarket prices at that date:
 - Prices are extracted from `history_prices` as the closest entry at or before the timepoint date
 - Prices are the market-implied probabilities (sum ≈ 1.0 but may not be exactly 1 due to fees)
 - These are used as the **market baseline** in Brier Score comparisons

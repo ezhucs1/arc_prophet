@@ -166,7 +166,7 @@ def record_to_html(rec: dict, idx: int) -> str:
     correct = rec.get("correct")
     error = rec.get("error")
     prob_yes = rec.get("agent_prob_yes")
-    human_yes = rec.get("human_prob_yes")
+    human_yes = rec.get("market_prob_yes")
     tool_count = rec.get("tool_call_count", 0)
     latency = rec.get("latency_sec", 0)
     close_date = rec.get("close_date", "")
