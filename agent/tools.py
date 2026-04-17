@@ -1,10 +1,26 @@
+import os
+import threading
+from contextlib import contextmanager
+
 from d_agent_client import Text2SQLIPCClient
 
 _D_AGENT_HOST    = "127.0.0.1"
-_D_AGENT_PORT    = 61001
+_D_AGENT_PORT    = 61002
 _D_AGENT_AUTHKEY = "secret123"
 
 _MAX_THREAD_CHARS = 8000
+
+_D_AGENT_MAX_INFLIGHT = int(os.environ.get("D_AGENT_MAX_INFLIGHT", "32"))
+_D_AGENT_SEMA = threading.Semaphore(_D_AGENT_MAX_INFLIGHT)
+
+
+@contextmanager
+def _d_agent_slot():
+    _D_AGENT_SEMA.acquire()
+    try:
+        yield
+    finally:
+        _D_AGENT_SEMA.release()
 
 
 def _cap(text: str, limit: int) -> str:
@@ -14,31 +30,35 @@ def _cap(text: str, limit: int) -> str:
 
 
 def _get_client() -> Text2SQLIPCClient:
-    return Text2SQLIPCClient.tcp(_D_AGENT_HOST, _D_AGENT_PORT, authkey=_D_AGENT_AUTHKEY)
+    # Default was 600s — a single stuck D-agent query could hang the whole
+    # question runner past the outer timeout. 30s is safe: vector queries are
+    # ~0.8s, SQL lookups are sub-second.
+    return Text2SQLIPCClient.tcp(_D_AGENT_HOST, _D_AGENT_PORT, authkey=_D_AGENT_AUTHKEY, timeout=30.0)
 
 
 def search_database(query: str, cutoff_time: str, doc_type: str = "", subreddit: str = "", start_time: str = "", engine: str = "vector", month: str = "", authors: str = "") -> str:
-    client = None
-    try:
-        lines = [f"Question: {query}", f"Cutoff_time: {cutoff_time}"]
-        if doc_type:
-            lines.append(f"Doc_type: {doc_type}")
-        if subreddit:
-            lines.append(f"Subreddits: {subreddit}")
-        if start_time:
-            lines.append(f"Start_time: {start_time}")
-        if month:
-            lines.append(f"Month: {month}")
-        if authors:
-            lines.append(f"Authors: {authors}")
-        engine = "vector"  # always vector; hybrid is deprecated (260s vs 0.1s)
-        client = _get_client()
-        return client.query("\n".join(lines), engine=engine)
-    except Exception as e:
-        return f"TOOL ERROR: The search failed. Reason: {str(e)}."
-    finally:
-        if client:
-            client.close()
+    with _d_agent_slot():
+        client = None
+        try:
+            lines = [f"Question: {query}", f"Cutoff_time: {cutoff_time}"]
+            if doc_type:
+                lines.append(f"Doc_type: {doc_type}")
+            if subreddit:
+                lines.append(f"Subreddits: {subreddit}")
+            if start_time:
+                lines.append(f"Start_time: {start_time}")
+            if month:
+                lines.append(f"Month: {month}")
+            if authors:
+                lines.append(f"Authors: {authors}")
+            engine = "vector"  # always vector; hybrid is deprecated (260s vs 0.1s)
+            client = _get_client()
+            return client.query("\n".join(lines), engine=engine)
+        except Exception as e:
+            return f"TOOL ERROR: The search failed. Reason: {str(e)}."
+        finally:
+            if client:
+                client.close()
 
 
 def _strip_compound_id(raw_id: str) -> str:
@@ -47,62 +67,66 @@ def _strip_compound_id(raw_id: str) -> str:
 
 
 def get_post_core_info(post_id: str, cutoff_time: str) -> str:
-    client = None
-    try:
-        post_id = _strip_compound_id(post_id)
-        client = _get_client()
-        return client.query(f'getpostcoreinfo("{post_id}", "{cutoff_time}")', engine="sql")
-    except Exception as e:
-        return f"TOOL ERROR: Could not retrieve post {post_id}. Reason: {str(e)}."
-    finally:
-        if client:
-            client.close()
+    with _d_agent_slot():
+        client = None
+        try:
+            post_id = _strip_compound_id(post_id)
+            client = _get_client()
+            return client.query(f'getpostcoreinfo("{post_id}", "{cutoff_time}")', engine="sql")
+        except Exception as e:
+            return f"TOOL ERROR: Could not retrieve post {post_id}. Reason: {str(e)}."
+        finally:
+            if client:
+                client.close()
 
 
 def get_comment_core_info(comment_id: str, cutoff_time: str) -> str:
-    client = None
-    try:
-        comment_id = _strip_compound_id(comment_id)
-        client = _get_client()
-        return client.query(f'getcommentcoreinfo("{comment_id}", "{cutoff_time}")', engine="sql")
-    except Exception as e:
-        return f"TOOL ERROR: Could not retrieve comment {comment_id}. Reason: {str(e)}."
-    finally:
-        if client:
-            client.close()
+    with _d_agent_slot():
+        client = None
+        try:
+            comment_id = _strip_compound_id(comment_id)
+            client = _get_client()
+            return client.query(f'getcommentcoreinfo("{comment_id}", "{cutoff_time}")', engine="sql")
+        except Exception as e:
+            return f"TOOL ERROR: Could not retrieve comment {comment_id}. Reason: {str(e)}."
+        finally:
+            if client:
+                client.close()
 
 
 def get_post_comments_list(comment_id: str, cutoff_time: str, up: int = 0, down: int = 0, max_comments: int = 100) -> str:
-    client = None
-    try:
-        comment_id = _strip_compound_id(comment_id)
-        client = _get_client()
-        result = client.query(
-            f'getpostcommentslist("{comment_id}", "{cutoff_time}", {up}, {down}, {max_comments})',
-            engine="sql"
-        )
-        return _cap(result, _MAX_THREAD_CHARS)
-    except Exception as e:
-        return f"TOOL ERROR: Could not retrieve thread for comment {comment_id}. Reason: {str(e)}."
-    finally:
-        if client:
-            client.close()
+    with _d_agent_slot():
+        client = None
+        try:
+            comment_id = _strip_compound_id(comment_id)
+            client = _get_client()
+            result = client.query(
+                f'getpostcommentslist("{comment_id}", "{cutoff_time}", {up}, {down}, {max_comments})',
+                engine="sql"
+            )
+            return _cap(result, _MAX_THREAD_CHARS)
+        except Exception as e:
+            return f"TOOL ERROR: Could not retrieve thread for comment {comment_id}. Reason: {str(e)}."
+        finally:
+            if client:
+                client.close()
 
 
 def get_author_history_list(author_id: str, cutoff_time: str, max_posts: int = 20, max_comments: int = 20) -> str:
-    client = None
-    try:
-        client = _get_client()
-        result = client.query(
-            f'getauthorhistorylist("{author_id}", "{cutoff_time}", {max_posts}, {max_comments})',
-            engine="sql"
-        )
-        return _cap(result, _MAX_THREAD_CHARS)
-    except Exception as e:
-        return f"TOOL ERROR: Could not retrieve history for author {author_id}. Reason: {str(e)}."
-    finally:
-        if client:
-            client.close()
+    with _d_agent_slot():
+        client = None
+        try:
+            client = _get_client()
+            result = client.query(
+                f'getauthorhistorylist("{author_id}", "{cutoff_time}", {max_posts}, {max_comments})',
+                engine="sql"
+            )
+            return _cap(result, _MAX_THREAD_CHARS)
+        except Exception as e:
+            return f"TOOL ERROR: Could not retrieve history for author {author_id}. Reason: {str(e)}."
+        finally:
+            if client:
+                client.close()
 
 
 # ── OpenAI function-calling schemas ──────────────────────────────────────────

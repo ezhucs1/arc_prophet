@@ -13,4 +13,4 @@ def get_client() -> OpenAI:
     return _client
 
 def get_model() -> str:
-    return os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3-14B-AWQ")
+    return os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3-4B")

@@ -16,29 +16,21 @@ wheels/
 database/*.jsonl
 
 # Eval results
-agent/results/*.jsonl
+results/*.jsonl
 
 # Runtime logs
 *.log
 logs/
 nohup.out
 
+# Archive (non-V2.1 code, paper docs, analysis — kept locally)
+_archive/
+
 # Scratch files
 clipboard.txt
-plan.md
-run_overnight.sh
 
 # Test/debug scripts (kept locally, not for repo)
-test_bottleneck.py
-test_db_speed.py
-test_full_speed.py
-test_nothink_speed.py
-test_react.py
-test_run_single.py
-test_thinking_speed.py
-test_vllm.py
-test_vllm_health.py
-test_text2sql_health.py
+test_*.py
 
 # Test trace outputs
 test_react_v2_*.txt
@@ -46,3 +38,6 @@ test_react_v2_*.txt
 # External docs
 eval/PD_Agent_Evaluation_Report-1.pdf
 eval/examples_s1_vs_s2.txt
+
+# Generated HTML
+eval/*.html

@@ -4,8 +4,8 @@ Benchmark evaluation for the ReAct agent on the Polymarket dataset.
 Usage:
     python agent/evals.py --max_questions 10
     python agent/evals.py --max_questions 100
-    python agent/evals.py --results_file agent/results/results_XXXXXX.jsonl   # resume
-    python agent/evals.py --summarize agent/results/results_XXXXXX.jsonl
+    python agent/evals.py --results_file results/results_XXXXXX.jsonl   # resume
+    python agent/evals.py --summarize results/results_XXXXXX.jsonl
 """
 
 import sys
@@ -27,7 +27,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database.loader import load_polymarket, load_polymarket_timeseries
-from agent.react_agent import run_react, generate_carry_forward
+from agent.react_agent import run_react, run_react_v2, generate_carry_forward
+
+# Set by --v2 CLI flag; when True, run_single uses run_react_v2 (structured-round driver).
+USE_V2 = False
 from agent.prompts import (
     ZERO_SHOT_SYSTEM_PROMPT, SETUP_PROMPTS,
     SETUP_IS_ZERO_SHOT, SETUP_HAS_TOOLS,
@@ -37,7 +40,7 @@ from agent.prompts import (
 )
 
 DATASET_PATH = Path(__file__).parent.parent / "database" / "polymarket_binary_yesno.jsonl"
-RESULTS_DIR  = Path(__file__).parent / "results"
+RESULTS_DIR  = Path(__file__).parent.parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 DEFAULT_TIMEOUT_SEC = 120
@@ -276,7 +279,8 @@ def run_single(question: str, options: list[str], cutoff_time: str,
                reflection: bool = False,
                thinking: bool = True,
                setup: int | None = None,
-               carry_context: str = "") -> dict:
+               carry_context: str = "",
+               description: str = "") -> dict:
     """
     Run one ReAct question with timeout.
 
@@ -290,10 +294,12 @@ def run_single(question: str, options: list[str], cutoff_time: str,
     timer.start()
     start = time.time()
     try:
-        result = run_react(question, options, cutoff_time,
-                           reflection=reflection, thinking=thinking,
-                           setup=setup, carry_context=carry_context,
-                           cancel_event=cancel, timeout_sec=timeout_sec)
+        _runner = run_react_v2 if USE_V2 else run_react
+        result = _runner(question, options, cutoff_time,
+                         reflection=reflection, thinking=thinking,
+                         setup=setup, carry_context=carry_context,
+                         cancel_event=cancel, timeout_sec=timeout_sec,
+                         description=description)
         return result
     except Exception as e:
         return {"final_answer": "", "tool_call_count": 0, "iteration_count": 0,
@@ -303,23 +309,26 @@ def run_single(question: str, options: list[str], cutoff_time: str,
 
 
 def _run_zero_shot_impl(question: str, options: list[str], cutoff_time: str,
-                        timeout_sec: int = 90) -> dict:
+                        timeout_sec: int = 90, description: str = "") -> dict:
     """Inner zero-shot logic with per-call HTTP timeout."""
     from shared.llm import get_client, get_model
     start = time.time()
     client = get_client()
     model  = get_model()
     options_str = ", ".join(options)
+    user_content = f"Question: {question}\n"
+    if description:
+        user_content += f"Description: {description}\n"
+    user_content += (
+        f"Options: {options_str}\n"
+        f"Cutoff Date: {cutoff_time}\n\n"
+        f"You MUST select exactly one of the provided options as your final answer."
+    )
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": ZERO_SHOT_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"Question: {question}\n"
-                f"Options: {options_str}\n"
-                f"Cutoff Date: {cutoff_time}\n\n"
-                f"You MUST select exactly one of the provided options as your final answer."
-            )},
+            {"role": "user", "content": user_content},
         ],
         temperature=0.1,
         max_tokens=8192,
@@ -337,10 +346,10 @@ def _run_zero_shot_impl(question: str, options: list[str], cutoff_time: str,
 
 
 def run_zero_shot(question: str, options: list[str], cutoff_time: str,
-                  timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> dict:
+                  timeout_sec: int = DEFAULT_TIMEOUT_SEC, description: str = "") -> dict:
     """Single LLM call with no tools — pure zero-shot baseline. Thread-safe."""
     try:
-        return _run_zero_shot_impl(question, options, cutoff_time, timeout_sec=timeout_sec)
+        return _run_zero_shot_impl(question, options, cutoff_time, timeout_sec=timeout_sec, description=description)
     except Exception as e:
         return {"final_answer": "", "tool_call_count": 0, "iteration_count": 0, "latency_sec": 0.0, "error": str(e)}
 
@@ -478,11 +487,13 @@ def _process_question_timepoints(
 
         # Run prediction (no SIGALRM in threads — timeout handled by LLM client)
         if is_zs:
-            result = run_zero_shot(item["question"], item["options"], tp["date"], timeout_sec)
+            result = run_zero_shot(item["question"], item["options"], tp["date"], timeout_sec,
+                                   description=item.get("description", ""))
         else:
             result = run_single(item["question"], item["options"], tp["date"],
                                 timeout_sec, thinking=thinking,
-                                setup=setup, carry_context=carry_ctx)
+                                setup=setup, carry_context=carry_ctx,
+                                description=item.get("description", ""))
 
         # Unified extraction
         pred = extract_agent_prediction(result["final_answer"], item["options"])
@@ -543,6 +554,7 @@ def _process_question_timepoints(
             "timepoint_date":    tp["date"],
             "total_timepoints":  n_timepoints,
             "question":          item["question"],
+            "description":       item.get("description", ""),
             "options":           item["options"],
             "ground_truth":      item["ground_truth"],
             "close_date":        item["close_date"],
@@ -692,11 +704,13 @@ def _process_single_question(
 
     if is_zs:
         result = run_zero_shot(item["question"], item["options"],
-                               item["cutoff_date"], timeout_sec)
+                               item["cutoff_date"], timeout_sec,
+                               description=item.get("description", ""))
     else:
         result = run_single(item["question"], item["options"],
                             item["cutoff_date"], timeout_sec,
-                            thinking=thinking, setup=setup)
+                            thinking=thinking, setup=setup,
+                            description=item.get("description", ""))
 
     # Unified extraction: XML <prediction> → P(Yes): → legacy Confidence:
     pred = extract_agent_prediction(result["final_answer"], item["options"])
@@ -720,6 +734,7 @@ def _process_single_question(
         "question_id":     question_id,
         "setup":           setup,
         "question":        item["question"],
+        "description":     item.get("description", ""),
         "options":         item["options"],
         "ground_truth":    item["ground_truth"],
         "cutoff_date":     item["cutoff_date"],
@@ -853,7 +868,12 @@ if __name__ == "__main__":
                         help="Disable Qwen3 extended thinking (<think> blocks) for ~4-5x faster "
                              "inference. Reduces per-call latency from ~80s to ~15s at some "
                              "quality cost. Has no effect on --zero_shot mode.")
+    parser.add_argument("--v2",             action="store_true",
+                        help="Use structured-round driver (run_react_v2) — NOTHINK V2.1 is "
+                             "the recommended config. Pairs well with --no_thinking.")
     args = parser.parse_args()
+    if args.v2:
+        globals()["USE_V2"] = True
 
     dataset_path = Path(args.dataset) if args.dataset else DATASET_PATH
 

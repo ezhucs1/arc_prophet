@@ -176,12 +176,15 @@ def load_polymarket_timeseries(
             source = pred.get("source_payload") or {}
             topic = source.get("category", "") if isinstance(source, dict) else ""
 
+            description = source.get("description", "") if isinstance(source, dict) else ""
+
             results.append({
                 "question":   title,
                 "options":    ["Yes", "No"],
                 "ground_truth": gt,
                 "close_date": close_date,
                 "topic":      topic,
+                "description": description,
                 "timepoints": timepoints,
             })
 
@@ -233,6 +236,8 @@ def load_polymarket(path: Path = DEFAULT_PATH, max_items: int = None) -> list[di
             source = pred.get("source_payload") or {}
             topic = source.get("category", "") if isinstance(source, dict) else ""
 
+            description = source.get("description", "") if isinstance(source, dict) else ""
+
             results.append({
                 "question":        title,
                 "options":         ["Yes", "No"],
@@ -241,6 +246,7 @@ def load_polymarket(path: Path = DEFAULT_PATH, max_items: int = None) -> list[di
                 "market_prob_yes": market_prob_yes,
                 "market_prob_no":  market_prob_no,
                 "topic":           topic,
+                "description":     description,
             })
 
             if max_items and len(results) >= max_items:

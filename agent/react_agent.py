@@ -4,6 +4,7 @@ ReAct agent — plain while-loop, no frameworks.
 Loop: call LLM → if tool calls, execute them → repeat → return final answer.
 """
 
+import os
 import re
 import sys
 import json
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.llm import get_client, get_model
 from agent.tools import TOOL_MAP, TOOL_SCHEMAS
 from agent.prompts import (
-    REACT_SYSTEM_PROMPT, REACT_SYSTEM_PROMPT_REFLECTION,
+    REACT_SYSTEM_PROMPT, REACT_SYSTEM_PROMPT_REFLECTION, REACT_SYSTEM_PROMPT_V2,
     SETUP_PROMPTS, SETUP_IS_ZERO_SHOT, SETUP_HAS_TOOLS,
     CONCLUSION_GENERATION_PROMPT, SELF_CRITIQUE_GENERATION_PROMPT,
 )
@@ -108,14 +109,15 @@ def run_react(
     question: str,
     options: list[str],
     cutoff_time: str,
-    max_iterations: int = 20,
+    max_iterations: int = 8,
     reflection: bool = False,
     thinking: bool = True,
-    max_tokens: int = 8192,
+    max_tokens: int = 1500,
     setup: int | None = None,
     carry_context: str = "",
     cancel_event: threading.Event | None = None,
     timeout_sec: int | None = None,
+    description: str = "",
 ) -> dict:
     """
     Run the ReAct loop for one question.
@@ -152,8 +154,10 @@ def run_react(
         system_prompt = REACT_SYSTEM_PROMPT_REFLECTION if reflection else REACT_SYSTEM_PROMPT
 
     options_str = ", ".join(options)
-    user_content = (
-        f"Question: {question}\n"
+    user_content = f"Question: {question}\n"
+    if description:
+        user_content += f"Description: {description}\n"
+    user_content += (
         f"Options: {options_str}\n"
         f"Cutoff Date: {cutoff_time}"
     )
@@ -169,13 +173,22 @@ def run_react(
     iteration_count  = 0
     round_count      = 0   # tracks search rounds for forced multi-round
     seen_searches: set[tuple[str, str]] = set()  # (query, subreddit) dedup
+    similar_reject_count = 0  # total TOO SIMILAR rejections; after 5, let through
     seen_drilldowns: set[str] = set()             # object_id dedup across iterations
     start            = time.time()
     last_prompt_toks = 0   # updated from response.usage after each successful call
     trace_parts: list[str] = []  # full reasoning trace across all iterations
 
     # vLLM extra_body for Qwen3 thinking control
-    extra_body = {"chat_template_kwargs": {"enable_thinking": thinking}}
+    # thinking_budget caps <think> block length per turn — prevents
+    # rambling self-talk in smaller models while preserving hypothesis planning.
+    # Passed via chat_template_kwargs (Qwen3 chat template feature).
+    _thinking_kwargs = {"enable_thinking": thinking}
+    if thinking:
+        _thinking_kwargs["thinking_budget"] = 300
+    extra_body = {
+        "chat_template_kwargs": _thinking_kwargs,
+    }
 
     def _timed_out() -> bool:
         """Check both cancel_event and wall-clock budget."""
@@ -185,29 +198,43 @@ def run_react(
             return True
         return False
 
-    def _graceful_timeout(client, model, error_label: str = "GRACEFUL_TIMEOUT") -> dict:
-        """Force one final LLM call to extract a prediction from whatever
-        evidence was gathered so far.  Returns *error_label* (got a prediction)
-        or TIMEOUT (even the final call failed)."""
+    # Regex for guided generation: forces valid <prediction> XML output.
+    _PREDICTION_REGEX = (
+        r"<prediction>\s*"
+        r"<yes>(0(\.\d{1,4})?|1(\.0{1,4})?)</yes>\s*"
+        r"<no>(0(\.\d{1,4})?|1(\.0{1,4})?)</no>\s*"
+        r"<reasoning>[^<]{10,500}</reasoning>\s*"
+        r"</prediction>"
+    )
+
+    def _guided_final_prediction(client, model, messages, extra_body,
+                                  trace_parts, tool_call_count, iteration_count, start,
+                                  error_label=None) -> dict:
+        """Force a structured final prediction using guided generation.
+
+        Sends one last LLM call with guided_regex to guarantee parseable
+        <prediction> XML output regardless of model size.
+        """
         try:
             messages.append({
                 "role": "user",
                 "content": (
-                    "TIME BUDGET EXCEEDED. Based on ALL evidence you have gathered so far, "
-                    "produce your final prediction NOW. Do not call any more tools.\n\n"
-                    "<prediction>\n"
-                    "  <yes>{probability}</yes>\n"
-                    "  <no>{probability}</no>\n"
-                    "  <reasoning>{synthesize all evidence gathered}</reasoning>\n"
-                    "</prediction>"
+                    "Based on ALL evidence gathered, produce your final prediction NOW. "
+                    "Do not call any more tools. Output ONLY the <prediction> XML block."
                 ),
             })
+            # Disable thinking for the final structured call — we only
+            # need the XML output, not more reasoning.
+            final_extra = {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "guided_regex": _PREDICTION_REGEX,
+            }
             final = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=1024,
-                extra_body=extra_body,
+                max_tokens=512,
+                extra_body=final_extra,
                 timeout=30.0,
             )
             content = final.choices[0].message.content or ""
@@ -221,18 +248,34 @@ def run_react(
                 "error":           error_label,
             }
         except Exception:
+            # Guided generation failed — fall back to unguided
             return {
                 "final_answer":    "\n\n".join(trace_parts),
                 "tool_call_count": tool_call_count,
                 "iteration_count": iteration_count,
                 "latency_sec":     round(time.time() - start, 2),
-                "error":           "TIMEOUT",
+                "error":           error_label or "GUIDED_PARSE_FAIL",
             }
+
+    def _final_prediction(client, model, error_label=None) -> dict:
+        """Produce the final <prediction> XML via guided-regex."""
+        return _guided_final_prediction(
+            client, model, messages, extra_body,
+            trace_parts, tool_call_count, iteration_count, start,
+            error_label=error_label,
+        )
+
+    def _graceful_timeout(client, model, error_label: str = "GRACEFUL_TIMEOUT") -> dict:
+        """Force one final LLM call to extract a prediction from whatever
+        evidence was gathered so far, using guided generation for reliable
+        XML output.  Returns *error_label* (got a prediction) or TIMEOUT
+        (even the final call failed)."""
+        return _final_prediction(client, model, error_label=error_label)
 
     # Per-call HTTP timeout — must be shorter than overall budget so we get
     # a chance to check the budget between calls.  90s is generous for a
     # single vLLM generation; if it takes longer something is wrong.
-    _HTTP_TIMEOUT = min(90.0, (timeout_sec or 90.0))
+    _HTTP_TIMEOUT = min(15.0, (timeout_sec or 15.0))
 
     try:
         client = get_client()
@@ -297,7 +340,12 @@ def run_react(
                     "error":           "TOKEN_LIMIT",
                 }
 
-            assistant_turn = {"role": "assistant", "content": msg.content or ""}
+            # Keep full assistant content (including <think>) in message
+            # history so the model retains its evidence synthesis between
+            # rounds.  Per-turn size is capped by thinking_budget: 300.
+            raw_content = msg.content or ""
+
+            assistant_turn = {"role": "assistant", "content": raw_content}
             if msg.tool_calls:
                 assistant_turn["tool_calls"] = [
                     {
@@ -309,9 +357,9 @@ def run_react(
                 ]
             messages.append(assistant_turn)
 
-            # Record assistant reasoning in the trace
-            if msg.content:
-                trace_parts.append(msg.content)
+            # Record full assistant reasoning (with thinking) in the trace
+            if raw_content:
+                trace_parts.append(raw_content)
 
             # Fallback: if model wrote tool calls as plain text <tool_call> instead
             # of using function-calling, parse them and re-inject as real tool calls.
@@ -341,30 +389,62 @@ def run_react(
                         ),
                     })
                     continue
-                return {
-                    "final_answer":    "\n\n".join(trace_parts),
-                    "tool_call_count": tool_call_count,
-                    "iteration_count": iteration_count,
-                    "latency_sec":     round(time.time() - start, 2),
-                    "error":           None,
-                }
+                # Force a structured final prediction via guided generation.
+                # This guarantees parseable XML regardless of model size.
+                return _final_prediction(client, model)
 
             # ── Execute all tool calls in parallel ──────────────────────
+            def _is_near_duplicate(query: str) -> bool:
+                """Check if query shares >60% of words with any previous query."""
+                words_new = set(query.strip().lower().split())
+                if not words_new:
+                    return False
+                for prev_query, _ in seen_searches:
+                    words_prev = set(prev_query.split())
+                    if not words_prev:
+                        continue
+                    overlap = len(words_new & words_prev) / min(len(words_new), len(words_prev))
+                    if overlap > 0.6:
+                        return True
+                return False
+
             def _exec_tool(tc):
                 """Execute a single tool call. Returns (tc, result_str)."""
+                nonlocal similar_reject_count
                 fn = TOOL_MAP.get(tc.function.name)
                 if fn is None:
                     return tc, f"Unknown tool: {tc.function.name}"
                 try:
                     args = json.loads(tc.function.arguments)
                     if tc.function.name == "search_database":
-                        key = (args.get("query", "").strip().lower(),
-                               args.get("subreddit", "").strip().lower())
+                        query = args.get("query", "").strip().lower()
+                        sub = args.get("subreddit", "").strip().lower()
+                        key = (query, sub)
                         if key in seen_searches:
                             return tc, ("DUPLICATE SEARCH: You already ran this exact query. "
-                                        "Review previous results and try a DIFFERENT search "
-                                        "angle targeting a different hypothesis.")
+                                        "Try a DIFFERENT search angle with different keywords.")
+                        if _is_near_duplicate(query):
+                            similar_reject_count += 1
+                            if similar_reject_count <= 2:
+                                # Build list of already-used words for guidance
+                                used_words = set()
+                                for prev_q, _ in seen_searches:
+                                    used_words.update(prev_q.split())
+                                return tc, (
+                                    f"TOO SIMILAR to a previous search (>60% word overlap). "
+                                    f"Words already covered: {', '.join(sorted(used_words)[:12])}. "
+                                    f"Check your GAPS list — search for those unsolved questions "
+                                    f"first using completely different keywords. If all gaps are "
+                                    f"addressed, investigate a new angle: different actors, "
+                                    f"mechanisms, obstacles, or historical precedents."
+                                )
+                            # After 2 rejections, let searches through to prevent
+                            # infinite loops — a redundant search (0.8s) is cheaper
+                            # than another wasted iteration (~5-10s).
                         seen_searches.add(key)
+                        # Round 1: force all-subreddit search (strip subreddit)
+                        if round_count == 0 and sub:
+                            args.pop("subreddit", None)
                     return tc, str(fn(**args))
                 except Exception as e:
                     return tc, f"TOOL ERROR: {e}"
@@ -480,13 +560,18 @@ def run_react(
             if has_searches:
                 round_count += 1
             if round_count < 3 and has_searches and not _timed_out():
+                n_next = '3-4' if round_count == 1 else '2-3'
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"Round {round_count} of 3 complete. Review the evidence above. "
-                        f"Identify NEW leads (names, dates, events, numbers) and do "
-                        f"{'3-4' if round_count == 1 else '2-3'} follow-up searches "
-                        f"targeting gaps in your evidence. Do NOT predict yet."
+                        f"Round {round_count} of 3 complete. Before searching, you MUST "
+                        f"write these 4 lines as visible text (NOT inside <think>):\n\n"
+                        f"FOUND: [2-3 key facts discovered this round]\n"
+                        f"GAPS: [2-3 specific unanswered questions]\n"
+                        f"P(Yes): {{previous}} → {{updated}} because {{one reason}}\n"
+                        f"NEXT: [{n_next} search queries targeting the gaps above — "
+                        f"each MUST use DIFFERENT keywords than all previous searches]\n\n"
+                        f"Then issue your {n_next} searches. Do NOT predict yet."
                     ),
                 })
 
@@ -505,6 +590,390 @@ def run_react(
             "iteration_count": iteration_count,
             "latency_sec":     round(time.time() - start, 2),
             "error":           str(e),
+        }
+
+
+def run_react_v2(
+    question: str,
+    options: list[str],
+    cutoff_time: str,
+    max_rounds: int | None = None,
+    thinking: bool = True,
+    setup: int | None = 2,
+    carry_context: str = "",
+    cancel_event: threading.Event | None = None,
+    timeout_sec: int | None = None,
+    description: str = "",
+    **_kwargs,
+) -> dict:
+    """Xiao-style structured-round driver.
+
+    Each round: LLM emits <state>/<plan>/<queries> -> we parse & run queries
+    in parallel + auto-drilldown -> LLM emits <rethink> -> termination check.
+    Terminates on empty gaps, stable p_yes, or max_rounds. Final prediction
+    via guided regex.
+    """
+    options_str = ", ".join(options)
+    user_content = f"Question: {question}\n"
+    if description:
+        user_content += f"Description: {description}\n"
+    user_content += f"Options: {options_str}\nCutoff Date: {cutoff_time}"
+    if carry_context:
+        user_content += f"\n{carry_context}"
+    user_content += "\n\nBegin round 1."
+
+    messages = [
+        {"role": "system", "content": REACT_SYSTEM_PROMPT_V2},
+        {"role": "user", "content": user_content},
+    ]
+
+    # NOTE: thinking_budget is silently ignored by this vLLM version; rely on
+    # max_tokens as the hard cap. Call A gets enough room for <think> + structured.
+    _thinking_kwargs = {"enable_thinking": thinking}
+    extra_body = {"chat_template_kwargs": _thinking_kwargs}
+    # V2.1 (default) / v21plus / v23 variant selection via V2_VARIANT env var
+    _variant = os.getenv("V2_VARIANT", "v21").lower()
+    if _variant == "v23":
+        drilldown_top_k = 5
+        if max_rounds is None:
+            max_rounds = 5
+    elif _variant == "v21plus":
+        # V2.1 with wider fan-out (6-10 queries) + one extra round.
+        # Drilldown stays at 3 to avoid the opinion-volume regression V2.3 hit.
+        drilldown_top_k = 3
+        if max_rounds is None:
+            max_rounds = 5
+    elif _variant == "v21pp":
+        # V2.1 + symmetric sourced-evidence calibration rule (prompt-only change).
+        # Same runtime config as V2.1 — isolated test of the calibration hypothesis.
+        drilldown_top_k = 3
+        if max_rounds is None:
+            max_rounds = 4
+    elif _variant == "v21ppp":
+        # V2.1 + auto author_history on top-1 hit per search (driver-only change).
+        # Adds cheap metadata to test tool-count lever without opinion-flooding.
+        drilldown_top_k = 3
+        if max_rounds is None:
+            max_rounds = 4
+    else:
+        drilldown_top_k = 3
+        if max_rounds is None:
+            max_rounds = 4
+    call_a_max = 1800 if thinking else 1200
+    call_b_max = 600
+    new_hits_per_round: list[int] = []
+
+    tool_call_count = 0
+    trace_parts: list[str] = []
+    seen_searches: set[tuple[str, str]] = set()
+    seen_drilldowns: set[str] = set()
+    seen_authors: set[str] = set()  # v21ppp: dedup author_history lookups across question
+    p_yes_history: list[float] = []
+    start = time.time()
+
+    _PREDICTION_REGEX = (
+        r"<prediction>\s*<yes>(0(\.\d{1,4})?|1(\.0{1,4})?)</yes>\s*"
+        r"<no>(0(\.\d{1,4})?|1(\.0{1,4})?)</no>\s*"
+        r"<reasoning>[^<]{10,500}</reasoning>\s*</prediction>"
+    )
+
+    def _timed_out() -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        if timeout_sec is not None and (time.time() - start) >= timeout_sec:
+            return True
+        return False
+
+    client = get_client()
+    model = get_model()
+
+    def _final_prediction_regex(error_label: str | None = None) -> dict:
+        msgs_final = messages + [{
+            "role": "user",
+            "content": "All rounds complete. Emit the final <prediction> block now based on all gathered evidence.",
+        }]
+        final_extra = {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "guided_regex": _PREDICTION_REGEX,
+        }
+        try:
+            final = client.chat.completions.create(
+                model=model, messages=msgs_final,
+                temperature=0.1, max_tokens=512,
+                extra_body=final_extra, timeout=30.0,
+            )
+            content = final.choices[0].message.content or ""
+            if content:
+                trace_parts.append(content)
+            return {
+                "final_answer":    "\n\n".join(trace_parts),
+                "tool_call_count": tool_call_count,
+                "iteration_count": len(p_yes_history),
+                "latency_sec":     round(time.time() - start, 2),
+                "error":           error_label,
+            }
+        except Exception as e:
+            return {
+                "final_answer":    "\n\n".join(trace_parts),
+                "tool_call_count": tool_call_count,
+                "iteration_count": len(p_yes_history),
+                "latency_sec":     round(time.time() - start, 2),
+                "error":           error_label or f"FINAL_FAIL: {e}",
+            }
+
+    def _final_prediction(error_label: str | None = None) -> dict:
+        """Produce the final <prediction> XML via guided-regex."""
+        return _final_prediction_regex(error_label)
+
+    try:
+        for round_n in range(1, max_rounds + 1):
+            if _timed_out():
+                return _final_prediction("TIMEOUT")
+
+            # ── Call A: emit <state>/<plan>/<queries> ──
+            try:
+                resp_a = client.chat.completions.create(
+                    model=model, messages=messages,
+                    temperature=0.1, max_tokens=call_a_max,
+                    stop=["</queries>"],
+                    extra_body=extra_body, timeout=45.0,
+                )
+            except Exception as e:
+                if "400" in str(e) or "context" in str(e).lower():
+                    return _final_prediction("CONTEXT_LIMIT")
+                raise
+
+            # Defensive: vLLM under saturation / degraded state can return a
+            # response whose .choices is None or empty. Treat that as a soft
+            # failure and drop into the final prediction path rather than
+            # crashing with 'NoneType'/'IndexError' and losing the whole run.
+            choices_a = getattr(resp_a, "choices", None) or []
+            if not choices_a:
+                trace_parts.append(f"[DEGRADED_RESPONSE] Round {round_n} call A: empty choices; ending rounds.")
+                return _final_prediction("DEGRADED_RESPONSE")
+            content_a = (choices_a[0].message.content or "") + "\n</queries>"
+            messages.append({"role": "assistant", "content": content_a})
+            trace_parts.append(f"=== ROUND {round_n} ===\n{content_a}")
+
+            # Parse <queries>; fall back to any {"q":...} JSON lines anywhere
+            # (rescues runs where <think> ate the budget and <queries> never opened)
+            queries: list[dict] = []
+            q_match = re.search(r"<queries>\s*(.*?)\s*</queries>", content_a, re.DOTALL)
+            scan_region = q_match.group(1) if q_match else content_a
+            for raw in re.findall(r'\{\s*"q"\s*:.*?\}', scan_region, re.DOTALL):
+                try:
+                    queries.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+            if not q_match and queries:
+                trace_parts.append(f"[FALLBACK] <queries> tag missing; recovered {len(queries)} JSON queries from content")
+            if not queries:
+                trace_parts.append("[VOID ROUND] no valid queries parsed — terminating")
+                break
+
+            # Intra-round fuzzy dedup only: >75% word overlap with a query already
+            # accepted THIS round is dropped. Inter-round dupes are handled by the
+            # exact-match seen_searches check inside _exec_query.
+            def _near_dup(q: str, against: list[str]) -> bool:
+                wn = set(q.lower().split())
+                if not wn:
+                    return True
+                for prev in against:
+                    wp = set(prev.lower().split())
+                    if not wp:
+                        continue
+                    if len(wn & wp) / min(len(wn), len(wp)) > 0.75:
+                        return True
+                return False
+
+            accepted: list[dict] = []
+            accepted_texts: list[str] = []
+            dropped = 0
+            for q in queries:
+                qt = (q.get("q") or "").strip()
+                if not qt or _near_dup(qt, accepted_texts):
+                    dropped += 1
+                    continue
+                accepted.append(q)
+                accepted_texts.append(qt.lower())
+            if dropped:
+                trace_parts.append(f"[DEDUP] dropped {dropped} near-duplicate queries this round")
+            queries = accepted
+            if not queries:
+                trace_parts.append("[VOID ROUND] all queries were near-duplicates — terminating")
+                break
+
+            # Extract gaps + p_yes for termination
+            gaps_empty = False
+            gaps_m = re.search(r"<gaps>(.*?)</gaps>", content_a, re.DOTALL)
+            if gaps_m:
+                gtxt = gaps_m.group(1).strip().lower()
+                stripped = re.sub(r"[\-\s]", "", gtxt)
+                if not stripped or stripped == "none":
+                    gaps_empty = True
+            pyes_m = re.search(r"<p_yes>\s*([\d.]+)\s*</p_yes>", content_a)
+            if pyes_m:
+                try:
+                    p_yes_history.append(float(pyes_m.group(1)))
+                except ValueError:
+                    pass
+
+            # ── Execute queries in parallel ──
+            def _exec_query(q: dict):
+                qtext = (q.get("q") or "").strip()
+                sub = (q.get("subreddit") or "").strip()
+                args: dict = {"query": qtext, "cutoff_time": cutoff_time}
+                # Round 1: drop subreddit to cast wide (consistent with v1)
+                if sub and round_n > 1:
+                    args["subreddit"] = sub
+                key = (qtext.lower(), args.get("subreddit", "").lower())
+                if key in seen_searches:
+                    return args, "DUPLICATE SEARCH — use different keywords next round."
+                seen_searches.add(key)
+                try:
+                    return args, str(TOOL_MAP["search_database"](**args))
+                except Exception as e:
+                    return args, f"TOOL ERROR: {e}"
+
+            if _timed_out():
+                return _final_prediction("TIMEOUT")
+            with ThreadPoolExecutor(max_workers=max(1, len(queries))) as pool:
+                q_results = list(pool.map(_exec_query, queries))
+            tool_call_count += len(q_results)
+
+            # ── Auto-drilldown top-K per successful search ──
+            drilldowns: list[tuple[str, dict, str]] = []
+            round_new_hits = 0
+            for args, result_str in q_results:
+                try:
+                    hits = json.loads(result_str).get("hits", [])[:drilldown_top_k]
+                except Exception:
+                    hits = []
+                for hit in hits:
+                    oid = hit.get("object_id", "")
+                    if not oid or oid in seen_drilldowns:
+                        continue
+                    seen_drilldowns.add(oid)
+                    round_new_hits += 1
+                    if hit.get("doc_type") == "comment":
+                        tn = "get_comment_core_info"
+                        d_args = {"comment_id": oid, "cutoff_time": cutoff_time}
+                    else:
+                        tn = "get_post_core_info"
+                        d_args = {"post_id": oid, "cutoff_time": cutoff_time}
+                    try:
+                        drilldowns.append((tn, d_args, str(TOOL_MAP[tn](**d_args))))
+                    except Exception as e:
+                        drilldowns.append((tn, d_args, f"TOOL ERROR: {e}"))
+            tool_call_count += len(drilldowns)
+
+            # ── v21ppp: author_history on top-1 hit per search (cheap metadata) ──
+            author_lookups: list[tuple[str, dict, str]] = []
+            if _variant == "v21ppp":
+                for args, result_str in q_results:
+                    try:
+                        hits = json.loads(result_str).get("hits", [])
+                    except Exception:
+                        hits = []
+                    for hit in hits:
+                        author = (hit.get("author") or "").strip()
+                        if not author or author in ("[deleted]", "[removed]"):
+                            continue
+                        if author in seen_authors:
+                            break
+                        seen_authors.add(author)
+                        a_args = {"author_id": author, "cutoff_time": cutoff_time,
+                                  "max_posts": 5, "max_comments": 5}
+                        try:
+                            author_lookups.append(
+                                ("get_author_history_list", a_args,
+                                 str(TOOL_MAP["get_author_history_list"](**a_args)))
+                            )
+                        except Exception as e:
+                            author_lookups.append(
+                                ("get_author_history_list", a_args, f"TOOL ERROR: {e}")
+                            )
+                        break  # only top-1-with-author per search
+                tool_call_count += len(author_lookups)
+
+            # ── Build results message for round ──
+            results_blocks_msg = []
+            for args, res in q_results:
+                trimmed = _trim_search_result(res)
+                results_blocks_msg.append(
+                    f"[TOOL CALL] search_database({json.dumps(args, ensure_ascii=False)})\n[TOOL RESULT]\n{trimmed}"
+                )
+                trace_parts.append(
+                    f"[TOOL CALL] search_database({json.dumps(args, ensure_ascii=False)})\n[TOOL RESULT]\n{res}"
+                )
+            for tn, d_args, res in drilldowns:
+                results_blocks_msg.append(
+                    f"[AUTO-DRILLDOWN] {tn}({json.dumps(d_args, ensure_ascii=False)})\n{res}"
+                )
+                trace_parts.append(
+                    f"[AUTO-DRILLDOWN] {tn}({json.dumps(d_args, ensure_ascii=False)})\n[TOOL RESULT]\n{res}"
+                )
+            for tn, a_args, res in author_lookups:
+                results_blocks_msg.append(
+                    f"[AUTO-METADATA] {tn}({json.dumps(a_args, ensure_ascii=False)})\n{res}"
+                )
+                trace_parts.append(
+                    f"[AUTO-METADATA] {tn}({json.dumps(a_args, ensure_ascii=False)})\n[TOOL RESULT]\n{res}"
+                )
+
+            is_last = (round_n == max_rounds)
+            nudge = (
+                "This is the FINAL round. Emit <rethink> (3 sentences max), then the final <prediction> block."
+                if is_last else
+                "Emit <rethink> (3 sentences max) integrating this evidence. "
+                "Then either emit the next round's <state>/<plan>/<queries>, OR the final <prediction> if gaps are resolved."
+            )
+            messages.append({
+                "role": "user",
+                "content": f"Round {round_n} tool results:\n\n" + "\n\n".join(results_blocks_msg) + f"\n\n{nudge}",
+            })
+
+            # ── Call B: <rethink> ──
+            if _timed_out():
+                return _final_prediction("TIMEOUT")
+            try:
+                resp_b = client.chat.completions.create(
+                    model=model, messages=messages,
+                    temperature=0.1, max_tokens=call_b_max,
+                    stop=["</rethink>"],
+                    extra_body=extra_body, timeout=30.0,
+                )
+            except Exception as e:
+                if "400" in str(e) or "context" in str(e).lower():
+                    return _final_prediction("CONTEXT_LIMIT")
+                raise
+
+            choices_b = getattr(resp_b, "choices", None) or []
+            if not choices_b:
+                trace_parts.append(f"[DEGRADED_RESPONSE] Round {round_n} call B: empty choices; ending rounds.")
+                return _final_prediction("DEGRADED_RESPONSE")
+            content_b = (choices_b[0].message.content or "") + "\n</rethink>"
+            messages.append({"role": "assistant", "content": content_b})
+            trace_parts.append(content_b)
+
+            # ── Termination ──
+            new_hits_per_round.append(round_new_hits)
+            if gaps_empty:
+                trace_parts.append("[STOP] gaps empty")
+                break
+            if round_n >= 2 and round_new_hits == 0:
+                trace_parts.append("[STOP] zero new evidence this round")
+                break
+
+        return _final_prediction()
+
+    except Exception as e:
+        return {
+            "final_answer":    "\n\n".join(trace_parts),
+            "tool_call_count": tool_call_count,
+            "iteration_count": len(p_yes_history),
+            "latency_sec":     round(time.time() - start, 2),
+            "error":           f"V2_CRASH: {e}",
         }
 
 
